@@ -1,0 +1,21 @@
+services:
+  lfm-server:
+    build: .
+    container_name: lingua-franca-messenger
+    restart: unless-stopped
+    ports:
+      - "1863:1863"   # Dispatch Server (DS)
+      - "1864:1864"   # Notification Server (NS)
+      - "1865:1865"   # Switchboard Server (SB) ※未実装
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - LFM_DS_ADDR=:1863
+      - LFM_NS_ADDR=:1864
+      - LFM_SB_ADDR=:1865
+      # LFM_PUBLIC_HOST: クライアントに案内するホスト/IP。
+      # 実機クライアントを繋ぐ場合はこのVMのLAN上のIPを指定する。
+      - LFM_PUBLIC_HOST=127.0.0.1
+    env_file:
+      - .env

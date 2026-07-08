@@ -1,0 +1,23 @@
+# データ・ログ(永続化ボリューム)
+data/
+logs/
+
+# 環境設定
+.env
+
+# Go
+/bin/
+/lfm
+*.test
+*.out
+
+# エディタ
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# キャプチャファイルは基本docs/msnp8/captures配下で管理するが、
+# 個人情報を含む可能性のある生データはここで除外リストに追加していく想定
