@@ -1,0 +1,30 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Build Go binary
+        run: go build ./...
+
+      - name: Build Docker image
+        run: docker build -t lingua-franca-messenger:test .
+
+      - name: Smoke test container
+        run: |
+          docker run -d --name test-run -p 1863:1863 -p 1864:1864 lingua-franca-messenger:test
+          sleep 3
+          docker logs test-run
+          docker stop test-run
