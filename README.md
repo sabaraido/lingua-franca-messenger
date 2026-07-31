@@ -1,101 +1,113 @@
-# LFM (Lingua Franca Messenger)
+# Lingua Franca Messenger (LFM)
 
-LFM (Lingua Franca Messenger) は、MSNP(MSN Messenger/Windows Live Messengerが使用していたプロトコル)の
-エミュレータサーバーです。全バージョン(MSNP2〜MSNP21+)のクライアントを、
-「共通会話空間(lingua franca)」と呼ばれる内部イベント表現を介して相互接続することを目指します。
+An MSN Messenger protocol emulator server that supports multiple MSNP versions (MSNP8/9/10) through a common internal event representation.
 
-```
-Client A (MSNP8) --raw--> [Adapter A] --> Internal Event --> [Adapter B] --raw--> Client B (MSNP15)
-```
+> **Disclaimer**: This project is an unofficial fan-made server emulator and is not affiliated with, endorsed by, or connected to Microsoft Corporation in any way. MSN Messenger and related trademarks are the property of Microsoft Corporation.
 
-各クライアントは非改造のまま接続できることを前提とします。
+## Features
 
-## 現在のステータス
+- ✅ MSNP8/9/10 support
+- ✅ Passport (TWN) authentication emulation
+- ✅ Multi-user simultaneous login
+- ✅ Real-time status change notifications
+- ✅ Text chat between users
+- ✅ File transfer support
+- ✅ Contact list management (add/remove/block)
+- ✅ Persistent user data
 
-🚧 初期スケルトン段階。まずはMSNP8同士の完全な会話成立
-(テキスト・絵文字・ファイル転送・カメラ・音声 ※実機検証で機能有無を確認中)を目標にしています。
+## Tested Clients
 
-- [x] リポジトリ雛形
-- [x] Dispatch Server (DS) 最小実装(VER/CVR/USR応答のプレースホルダ)
-- [x] Notification Server (NS) 最小実装(ログイン応答のプレースホルダ)
-- [ ] Switchboard Server (SB)
-- [ ] MSNP8 実機キャプチャに基づく認証フローの正確な実装
-- [ ] 絵文字・ファイル転送・カメラ・音声のMSNP8対応状況の調査、実装
-- [ ] Adapter/Capability機構による多バージョン対応
+| Client | Version | Status |
+|--------|---------|--------|
+| MSN Messenger | 6.2.0205 | ✅ Working |
+| MSN Messenger | 5.0.0575 | 🔄 In progress |
 
-## ディレクトリ構成
+## Requirements
 
-```
-lingua-franca-messenger/
-├── src/
-│   ├── core/            # 共通イベント定義、イベントバス、エンコーディング変換
-│   ├── adapters/        # バージョンごとの方言(生コマンド <-> 内部イベント)変換
-│   ├── servers/
-│   │   ├── dispatch/    # DS
-│   │   ├── notification/# NS
-│   │   ├── switchboard/ # SB (未実装)
-│   │   └── passport/    # Passport/Live ID認証エミュレータ (未実装、MSNP11以降で必要)
-│   └── main.go
-├── docs/
-│   └── msnp8/            # 実機キャプチャ・プロトコル解析資料
-├── Dockerfile
-├── docker-compose.yml
-└── .env.example
-```
+- Docker & Docker Compose
+- Windows XP (or later) with MSN Messenger installed
+- Local network (LAN recommended)
 
-## セットアップ
+## Setup
 
-### 前提
+### 1. Clone this repository
 
-- Go 1.22+
-- Docker / Docker Compose
-- (実機検証用) Wireshark、Windows XP等のMSN Messenger/WLM実機環境
+\`\`\`bash
+git clone https://github.com/BeYour-Studio/linguafranca-messenger.git
+cd linguafranca-messenger
+\`\`\`
 
-### ローカルビルド
+### 2. Configure environment
 
-```bash
-go mod tidy   # golang.org/x/text 等の依存を取得(要ネットワーク)
-go build ./src
-```
-
-### Dockerでの起動
-
-```bash
+\`\`\`bash
 cp .env.example .env
-# .env の LFM_PUBLIC_HOST を、実機クライアントから見えるこのマシンのLAN IPに変更する
+\`\`\`
 
-docker compose up -d --build
-```
+Edit \`.env\` and set your server's IP address:
 
-デフォルトのポート:
+\`\`\`
+LFM_PUBLIC_HOST=192.168.1.x
+\`\`\`
 
-| サーバー | ポート | 役割 |
-|---|---|---|
-| DS (Dispatch Server) | 1863 | 初期接続、NSへのリダイレクト |
-| NS (Notification Server) | 1864 | ログイン、プレゼンス、連絡先 |
-| SB (Switchboard Server) | 1865 | 実際のチャット(未実装) |
+### 3. Start the server
 
-## 実機クライアントの接続方法(非改造)
+\`\`\`bash
+docker compose up -d
+\`\`\`
 
-MSN Messenger/WLMは起動時に `messenger.hotmail.com` 等の固定ホスト名に接続しようとします。
-クライアント自体を改造せずに接続させるには、クライアント環境側の **hostsファイル** で
-これらのホスト名をLFMサーバーのIPに向ける必要があります。
+### 4. Add a user
 
-```
-# クライアント環境の hosts ファイルに追記する例(実機検証で確定させる)
-<LFMサーバーのIP>   messenger.hotmail.com
-```
+\`\`\`bash
+docker compose exec lfm-server /app/lfm -adduser your@email.com:password:DisplayName
+\`\`\`
 
-具体的にどのホスト名の名前解決が必要になるかは、実機とWiresharkでの解析結果を
-`docs/msnp8/` にまとめながら確定させていきます。
+### 5. Configure client PC
 
-## 実機解析ワークフロー
+Edit \`C:\WINDOWS\system32\drivers\etc\hosts\` on the client PC:
 
-1. ブリッジ接続のVM(Windows XP + MSN Messenger/WLM)を用意
-2. ホスト側でWiresharkを起動し、`ip.addr == <VMのIP> && tcp.port == 1863` 等でフィルタ
-3. `Follow > TCP Stream` で生コマンドのやり取りをテキスト化
-4. `docs/msnp8/captures/` にpcapngを保存、`docs/msnp8/*.md` に注釈付きで整理
+\`\`\`
+192.168.1.x   messenger.hotmail.com
+192.168.1.x   gateway.messenger.hotmail.com
+192.168.1.x   nexus.passport.com
+192.168.1.x   login.passport.com
+\`\`\`
 
-## ライセンス
+### 6. Install CA certificate
 
-TBD
+Download \`ca-cert.cer\` from the server and install it in the Windows certificate store under **Trusted Root Certification Authorities**.
+
+### 7. Sign in
+
+Launch MSN Messenger and sign in with the credentials you created in step 4.
+
+## Architecture
+
+\`\`\`
+[MSN Messenger Client]
+        |
+        | TCP :1863 (Dispatch Server)
+        |
+[Dispatch Server] ──→ redirects to Notification Server
+        |
+        | TCP :1864 (Notification Server)
+        |
+[Notification Server] ──→ handles login, contacts, status
+        |
+        | HTTPS :443 (Passport Auth via stunnel)
+        |
+[stunnel + OpenSSL 1.0.2] ──→ handles SSLv2/SSLv3
+        |
+[Passport Server] ──→ emulates Microsoft Passport authentication
+        |
+        | TCP :1865 (Switchboard Server)
+        |
+[Switchboard Server] ──→ routes messages between users
+\`\`\`
+
+## Contributing
+
+Pull requests are welcome! Please feel free to submit issues and feature requests.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
