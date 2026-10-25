@@ -12,7 +12,7 @@ An MSN Messenger protocol emulator server that supports multiple MSNP versions (
 - ✅ Multi-user simultaneous login
 - ✅ Real-time status change notifications
 - ✅ Text chat between users, across protocol versions
-- ✅ Features newer clients send are translated for older ones (e.g. 7.0 nudges and winks appear as text in 5.0/6.2)
+- ✅ Each client sees its contacts' real client version, so 7.0/7.5 itself tells the user when a contact on 5.0/6.x can't receive nudges or winks. If one still reaches an older client, the server shows it as a text notice instead.
 - ✅ File transfer support
 - ✅ Contact list management (add/remove/block) and contact groups
 - ✅ Persistent user data
