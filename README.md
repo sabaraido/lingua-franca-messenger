@@ -20,7 +20,7 @@ An MSN Messenger protocol emulator server that supports multiple MSNP versions (
 | Client | Version | Status |
 |--------|---------|--------|
 | MSN Messenger | 6.2.0205 | ✅ Working |
-| MSN Messenger | 5.0.0575 | 🔄 In progress |
+| MSN Messenger | 5.0.0575 | ✅ Working |
 
 ## Requirements
 
@@ -33,8 +33,8 @@ An MSN Messenger protocol emulator server that supports multiple MSNP versions (
 ### 1. Clone this repository
 
 \`\`\`bash
-git clone https://github.com/BeYour-Studio/linguafranca-messenger.git
-cd linguafranca-messenger
+git clone https://github.com/sabaraido/lingua-franca-messenger.git
+cd lingua-franca-messenger
 \`\`\`
 
 ### 2. Configure environment
@@ -49,10 +49,19 @@ Edit \`.env\` and set your server's IP address:
 LFM_PUBLIC_HOST=192.168.1.x
 \`\`\`
 
+Generate your own root CA and Passport server certificate:
+
+\`\`\`bash
+scripts/gen-certs.sh
+\`\`\`
+
+Keep \`ca/ca-key.pem\` private. Clients trust this CA as a root authority, so anyone with the key could forge certificates for any site. Never commit or share \`ca/\`, \`certs/\` or \`.env\` (they are listed in \`.gitignore\`).
+
 ### 3. Start the server
 
 \`\`\`bash
-docker compose up -d
+docker build -f Dockerfile.base -t lfm-base:latest .   # first time only (OpenSSL 1.0.2 + stunnel)
+docker compose up -d --build
 \`\`\`
 
 ### 4. Add a user
@@ -61,9 +70,17 @@ docker compose up -d
 docker compose exec lfm-server /app/lfm -adduser your@email.com:password:DisplayName
 \`\`\`
 
+The running server picks up the change automatically; no restart is needed. Passwords are stored as bcrypt hashes. Hashes created by older versions (SHA-256) are upgraded to bcrypt on the user's next successful sign-in.
+
 ### 5. Configure client PC
 
-Edit \`C:\WINDOWS\system32\drivers\etc\hosts\` on the client PC:
+LFM includes a DNS server (UDP 53 on \`LFM_PUBLIC_HOST\`) that resolves \`*.messenger.hotmail.com\`, \`*.passport.com\` and \`*.passport.net\` to the server. Other names get an immediate NXDOMAIN, so the client does not hang waiting for unreachable Microsoft services.
+
+On the client PC, set the preferred DNS server to the server's IP (\`192.168.1.x\`):
+**Control Panel → Network Connections → Local Area Connection → Properties → Internet Protocol (TCP/IP) → Use the following DNS server addresses**.
+Leave the alternate DNS server empty, then run \`ipconfig /flushdns\`.
+
+If the client needs internet access too, set \`LFM_DNS_UPSTREAM=8.8.8.8:53\` (or your router) in \`.env\` to forward other names. To disable the built-in DNS server, set \`LFM_DNS_ADDR=off\` and edit the client's \`hosts\` file instead:
 
 \`\`\`
 192.168.1.x   messenger.hotmail.com
@@ -74,7 +91,7 @@ Edit \`C:\WINDOWS\system32\drivers\etc\hosts\` on the client PC:
 
 ### 6. Install CA certificate
 
-Download \`ca-cert.cer\` from the server and install it in the Windows certificate store under **Trusted Root Certification Authorities**.
+Copy \`ca/ca-cert.cer\` from the server to the client PC and install it in the Windows certificate store under **Trusted Root Certification Authorities**.
 
 ### 7. Sign in
 
@@ -103,6 +120,15 @@ Launch MSN Messenger and sign in with the credentials you created in step 4.
         |
 [Switchboard Server] ──→ routes messages between users
 \`\`\`
+
+## Development
+
+\`\`\`bash
+go vet ./...
+go test -race ./...
+\`\`\`
+
+\`src/integration\` starts the real servers and drives simulated MSNP8 (5.0) and MSNP10 (6.2) clients through sign-in, presence, blocking, reverse-list notifications, duplicate sign-in and cross-version chat.
 
 ## Contributing
 
