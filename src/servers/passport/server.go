@@ -1,11 +1,14 @@
 package passport
 
 import (
+	"bufio"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -42,44 +45,32 @@ func (s *Server) ListenAndServe() error {
 	}
 }
 
+// maxRequestBody はRST.srfなどのリクエスト本文の上限。
+const maxRequestBody = 64 * 1024
+
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
-	buf := make([]byte, 16384)
-	n, err := conn.Read(buf)
-	if err != nil || n == 0 {
+	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	req, err := http.ReadRequest(bufio.NewReader(conn))
+	if err != nil {
+		log.Printf("[Passport] bad request from %s: %v", conn.RemoteAddr(), err)
 		return
 	}
-	request := string(buf[:n])
-	lines := strings.Split(request, "\r\n")
-	if len(lines) == 0 {
-		return
-	}
+	defer req.Body.Close()
+	log.Printf("[Passport] request: %s %s from %s", req.Method, req.URL.Path, conn.RemoteAddr())
 
-	parts := strings.Fields(lines[0])
-	if len(parts) < 2 {
-		return
-	}
-	method := parts[0]
-	path := parts[1]
-	log.Printf("[Passport] request: %s %s from %s", method, path, conn.RemoteAddr())
-
-	// ヘッダーをパース
-	headers := make(map[string]string)
-	for _, line := range lines[1:] {
-		if line == "" {
-			break
-		}
-		kv := strings.SplitN(line, ": ", 2)
-		if len(kv) == 2 {
-			headers[strings.ToLower(kv[0])] = kv[1]
-		}
-	}
-
-	if strings.HasPrefix(path, "/rdr/pprdr.asp") {
+	switch {
+	case strings.HasPrefix(req.URL.Path, "/rdr/pprdr.asp"):
 		s.handleNexus(conn)
-	} else if strings.HasPrefix(path, "/login2.srf") {
-		s.handleLogin(conn, headers["authorization"])
-	} else {
+	case strings.HasPrefix(req.URL.Path, "/login2.srf"):
+		s.handleLogin(conn, req.Header.Get("Authorization"))
+	case strings.EqualFold(req.URL.Path, "/RST.srf") && req.Method == http.MethodPost:
+		body, err := io.ReadAll(io.LimitReader(req.Body, maxRequestBody))
+		if err != nil {
+			return
+		}
+		s.handleRST(conn, body)
+	default:
 		conn.Write([]byte("HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n"))
 	}
 }

@@ -5,10 +5,12 @@ package integration
 import (
 	"bufio"
 	"fmt"
+	"html"
 	"io"
 	"net"
 	"net/http"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -779,4 +781,77 @@ func TestGCFShields(t *testing.T) {
 	// ペイロードの後も通常のやり取りが続けられる
 	c.cmd("PNG")
 	c.expect("QNG")
+}
+
+// rstRequest は MSN Messenger 7.5 が RST.srf に送るSOAPリクエスト(の主要部分)。
+func rstRequest(email, password, policy string) string {
+	return `<?xml version="1.0" encoding="UTF-8"?>
+<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/" xmlns:wsse="http://schemas.xmlsoap.org/ws/2003/06/secext" xmlns:saml="urn:oasis:names:tc:SAML:1.0:assertion" xmlns:wsp="http://schemas.xmlsoap.org/ws/2002/12/policy" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd" xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/03/addressing" xmlns:wssc="http://schemas.xmlsoap.org/ws/2004/04/sc" xmlns:wst="http://schemas.xmlsoap.org/ws/2004/04/trust">
+<Header>
+<ps:AuthInfo xmlns:ps="http://schemas.microsoft.com/Passport/SoapServices/PPCRL" Id="PPAuthInfo"><ps:HostingApp>{7108E71A-9926-4FCB-BCC9-9A9D3F32E423}</ps:HostingApp><ps:BinaryVersion>3</ps:BinaryVersion><ps:UIVersion>1</ps:UIVersion><ps:Cookies></ps:Cookies><ps:RequestParams>AQAAAAIAAABsYwQAAAAxMDQx</ps:RequestParams></ps:AuthInfo>
+<wsse:Security><wsse:UsernameToken Id="user"><wsse:Username>` + email + `</wsse:Username><wsse:Password>` + password + `</wsse:Password></wsse:UsernameToken></wsse:Security>
+</Header>
+<Body>
+<ps:RequestMultipleSecurityTokens xmlns:ps="http://schemas.microsoft.com/Passport/SoapServices/PPCRL" Id="RSTS">
+<wst:RequestSecurityToken Id="RST0"><wst:RequestType>http://schemas.xmlsoap.org/ws/2004/04/security/trust/Issue</wst:RequestType><wsp:AppliesTo><wsa:EndpointReference><wsa:Address>http://Passport.NET/tb</wsa:Address></wsa:EndpointReference></wsp:AppliesTo></wst:RequestSecurityToken>
+<wst:RequestSecurityToken Id="RST1"><wst:RequestType>http://schemas.xmlsoap.org/ws/2004/04/security/trust/Issue</wst:RequestType><wsp:AppliesTo><wsa:EndpointReference><wsa:Address>messenger.msn.com</wsa:Address></wsa:EndpointReference></wsp:AppliesTo><wsse:PolicyReference URI="` + policy + `"></wsse:PolicyReference></wst:RequestSecurityToken>
+</ps:RequestMultipleSecurityTokens>
+</Body>
+</Envelope>`
+}
+
+var reMessengerToken = regexp.MustCompile(`<wsa:Address>messenger\.msn\.com</wsa:Address>.*?<wsse:BinarySecurityToken[^>]*>([^<]*)</wsse:BinarySecurityToken>`)
+
+func (e *env) rst(email, password, policy string) (int, string) {
+	e.t.Helper()
+	resp, err := http.Post("http://"+e.ppAddr+"/RST.srf", "text/xml", strings.NewReader(rstRequest(email, password, policy)))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(body)
+}
+
+func TestRSTLoginLike75(t *testing.T) {
+	e := newEnv(t)
+	c := e.connect("bob@test.com", "MSNP12 MSNP11 MSNP10")
+	status, body := e.rst("bob@test.com", "pw", "?id=507")
+	if status != 200 {
+		t.Fatalf("RST status = %d", status)
+	}
+	m := reMessengerToken.FindStringSubmatch(body)
+	if m == nil {
+		t.Fatalf("no messenger.msn.com token in response: %s", body)
+	}
+	ticket := html.UnescapeString(m[1])
+	if !strings.HasPrefix(ticket, "t=") || !strings.Contains(body, "http://Passport.NET/tb") {
+		t.Fatalf("unexpected RST response: %s", body)
+	}
+
+	c.cmd("USR TWN S %s", ticket)
+	c.expect("USR 4 OK bob@test.com 1 0")
+}
+
+func TestRSTWrongPassword(t *testing.T) {
+	e := newEnv(t)
+	status, body := e.rst("bob@test.com", "wrong", "?id=507")
+	if status != 200 || !strings.Contains(body, "wsse:FailedAuthentication") {
+		t.Fatalf("expected SOAP fault, got %d %s", status, body)
+	}
+	if reMessengerToken.MatchString(body) {
+		t.Fatal("no token should be issued for a wrong password")
+	}
+}
+
+func TestRSTEscapedCredentials(t *testing.T) {
+	e := newEnv(t)
+	if err := e.store.AddUser("amp@test.com", "a&b<c", "Amp"); err != nil {
+		t.Fatal(err)
+	}
+	// XML中では & や < はエスケープされて届く
+	_, body := e.rst("amp@test.com", "a&amp;b&lt;c", "?id=507")
+	if !reMessengerToken.MatchString(body) {
+		t.Fatalf("escaped password should be accepted: %s", body)
+	}
 }
