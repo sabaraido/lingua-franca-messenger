@@ -1,0 +1,12 @@
+# ビルドに不要なもの・秘密情報はビルドコンテキストに含めない
+.git
+.github
+.env
+data/
+logs/
+ca/
+certs/
+*.cer
+*.pem
+*.zip
+docs/

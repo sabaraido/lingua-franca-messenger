@@ -4,12 +4,15 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 
-	"github.com/BeYour-Studio/lingua-franca-messenger/src/core"
-	"github.com/BeYour-Studio/lingua-franca-messenger/src/servers/dispatch"
-	"github.com/BeYour-Studio/lingua-franca-messenger/src/servers/notification"
-	"github.com/BeYour-Studio/lingua-franca-messenger/src/servers/passport"
+	"github.com/sabaraido/lingua-franca-messenger/src/core"
+	"github.com/sabaraido/lingua-franca-messenger/src/servers/dispatch"
+	"github.com/sabaraido/lingua-franca-messenger/src/servers/dns"
+	"github.com/sabaraido/lingua-franca-messenger/src/servers/notification"
+	"github.com/sabaraido/lingua-franca-messenger/src/servers/passport"
+	"github.com/sabaraido/lingua-franca-messenger/src/servers/switchboard"
 )
 
 func getEnv(key, fallback string) string {
@@ -24,7 +27,6 @@ func main() {
 
 	usersPath := getEnv("LFM_USERS_PATH", "/app/data/users.json")
 
-	// -adduser email:password:friendlyname 形式でユーザー登録だけして終了する。
 	addUser := flag.String("adduser", "", "email:password:friendlyname 形式でユーザーを追加/更新して終了する")
 	flag.Parse()
 
@@ -47,36 +49,50 @@ func main() {
 
 	log.Println("LFM (Lingua Franca Messenger) starting...")
 
-	dsAddr := getEnv("LFM_DS_ADDR", ":1863")
+	dsAddr     := getEnv("LFM_DS_ADDR", ":1863")
 	nsListenAddr := getEnv("LFM_NS_ADDR", ":1864")
-	publicHost := getEnv("LFM_PUBLIC_HOST", "127.0.0.1")
+	sbListenAddr := getEnv("LFM_SB_ADDR", ":1865")
+	publicHost  := getEnv("LFM_PUBLIC_HOST", "127.0.0.1")
 
 	nsPublicAddr := publicHost + ":1864"
 	sbPublicAddr := publicHost + ":1865"
 
+	// Passportチケット・SBキーなど、サーバー間で受け渡す使い捨てトークン
+	tokens := core.NewTokenStore()
+
+	sb := switchboard.New(sbListenAddr, tokens)
+	sb.PublicAddr = sbPublicAddr
+
+	ns := notification.New(nsListenAddr, sbPublicAddr, store, tokens)
+	sb.NS = ns
+
 	ds := dispatch.New(dsAddr, nsPublicAddr)
-	ns := notification.New(nsListenAddr, sbPublicAddr, store)
-	ps := passport.New("127.0.0.1:8080", store)
+	ps := passport.New("127.0.0.1:8080", store, tokens)
 
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 5)
 
-	go func() {
-		errCh <- ds.ListenAndServe()
-	}()
-	go func() {
-		errCh <- ns.ListenAndServe()
-	}()
-	go func() {
-		errCh <- ps.ListenAndServe()
-	}()
+	go func() { errCh <- ds.ListenAndServe() }()
+	go func() { errCh <- ns.ListenAndServe() }()
+	go func() { errCh <- ps.ListenAndServe() }()
+	go func() { errCh <- sb.ListenAndServe() }()
+
+	// DNS: MSN関連ドメインをこのサーバーへ向ける(クライアントのhosts編集が不要になる)。
+	// ホスト側のsystemd-resolved(127.0.0.53:53)と衝突しないよう、既定では公開IPだけで待ち受ける。
+	// LFM_DNS_ADDR=off で無効化。
+	if dnsAddr := getEnv("LFM_DNS_ADDR", publicHost+":53"); dnsAddr != "off" {
+		answerIP := net.ParseIP(publicHost)
+		if answerIP == nil || answerIP.To4() == nil {
+			log.Fatalf("LFM_PUBLIC_HOST must be an IPv4 address for DNS (got %q)", publicHost)
+		}
+		dnsServer := dns.New(dnsAddr, answerIP, os.Getenv("LFM_DNS_UPSTREAM"))
+		go func() { errCh <- dnsServer.ListenAndServe() }()
+	}
 
 	if err := <-errCh; err != nil {
 		log.Fatalf("server error: %v", err)
 	}
 }
 
-// parseAddUser は "email:password:friendlyname" をパースする。
-// friendlynameは省略可(その場合emailのローカル部を使う)。
 func parseAddUser(s string) (email, password, friendlyName string, err error) {
 	parts := splitN3(s, ':')
 	if len(parts) < 2 {

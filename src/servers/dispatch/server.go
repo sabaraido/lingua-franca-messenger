@@ -111,9 +111,16 @@ func (s *Server) handleLine(conn net.Conn, line string) {
 		s.write(conn, resp)
 	case "CVR":
 		// 例: CVR 2 0x0409 winnt 5.1 i386 MSNMSGR 6.2.0137 MSMSGS user@example.com
-		// TODO: 実機の値を記録し、パース＆応答の形式を確定する
-		resp := fmt.Sprintf("CVR %s 1.0.0000 1.0.0000 1.0.0000 %s %s\r\n",
-			trID, "https://example.invalid/", "https://example.invalid/")
+		// NSと同様に、クライアント自身のバージョンを推奨・最小バージョンとして返す
+		clientVersion := "6.2.0205"
+		for i, p := range parts {
+			if p == "MSNMSGR" && i+1 < len(parts) {
+				clientVersion = parts[i+1]
+				break
+			}
+		}
+		resp := fmt.Sprintf("CVR %s %s %s %s http://messenger.msn.com/ http://messenger.msn.com/\r\n",
+			trID, clientVersion, clientVersion, clientVersion)
 		s.write(conn, resp)
 
 	case "USR":

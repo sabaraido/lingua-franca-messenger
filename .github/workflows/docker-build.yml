@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,15 +16,35 @@ jobs:
         with:
           go-version: "1.22"
 
-      - name: Build Go binary
-        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      # Dockerfile は lfm-base(OpenSSL 1.0.2 + stunnel)を前提にしているので先に作る
+      - name: Build base image
+        run: docker build -f Dockerfile.base -t lfm-base:latest .
 
       - name: Build Docker image
         run: docker build -t lingua-franca-messenger:test .
 
       - name: Smoke test container
         run: |
-          docker run -d --name test-run -p 1863:1863 -p 1864:1864 lingua-franca-messenger:test
+          scripts/gen-certs.sh
+          mkdir -p data
+          docker run -d --name test-run \
+            -v "$PWD/certs:/app/certs:ro" -v "$PWD/data:/app/data" \
+            -e LFM_DNS_ADDR=off \
+            -p 1863:1863 -p 1864:1864 lingua-franca-messenger:test
           sleep 3
           docker logs test-run
+          test "$(docker inspect -f '{{.State.Running}}' test-run)" = true
+          docker logs test-run 2>&1 | grep -q '\[NS\] listening'
           docker stop test-run
