@@ -5,10 +5,13 @@
 # (クライアントはこのCAを信頼済みルートとして登録するため、
 #  秘密鍵が漏れると任意のサイトの証明書を偽造できてしまう)
 #
-# 使い方: scripts/gen-certs.sh [--force]
+# 使い方:
+#   scripts/gen-certs.sh          CAがなければ作る。サーバー証明書は毎回発行し直す
+#                                 (CAを作り直さない限り、クライアントの再設定は不要)
+#   scripts/gen-certs.sh --force  CAも作り直す(各クライアントに ca-cert.cer の再登録が必要)
 #
 # 生成物:
-#   ca/ca-key.pem      CAの秘密鍵(厳重に保管)
+#   ca/ca-key.pem      CAの秘密鍵(厳重に保管。消すとサーバー証明書を発行し直せなくなる)
 #   ca/ca-cert.pem     CA証明書
 #   ca/ca-cert.cer     CA証明書(DER形式)。クライアントの「信頼されたルート証明機関」に登録する
 #   certs/key.pem      サーバー秘密鍵(stunnelが使用)
@@ -17,8 +20,12 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-if [ -e ca/ca-key.pem ] && [ "${1:-}" != "--force" ]; then
-	echo "ca/ca-key.pem already exists. Use --force to regenerate (clients must re-install ca-cert.cer)." >&2
+force=false
+[ "${1:-}" = "--force" ] && force=true
+
+if ! $force && [ -e ca/ca-cert.pem ] && [ ! -e ca/ca-key.pem ]; then
+	echo "ca/ca-cert.pem exists but ca/ca-key.pem is missing, so new server certificates cannot be issued." >&2
+	echo "Run with --force to create a new CA (clients must re-install ca/ca-cert.cer)." >&2
 	exit 1
 fi
 
@@ -28,6 +35,7 @@ umask 077
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
+# 7.5 は loginnet.passport.com でPassportにアクセスする
 cat >"$tmp/server.cnf" <<'EOF'
 [req]
 distinguished_name = dn
@@ -38,15 +46,21 @@ CN = login.passport.com
 basicConstraints = CA:FALSE
 keyUsage = digitalSignature, keyEncipherment
 extendedKeyUsage = serverAuth
-subjectAltName = DNS:login.passport.com, DNS:nexus.passport.com, DNS:messenger.hotmail.com
+subjectAltName = DNS:login.passport.com, DNS:loginnet.passport.com, DNS:nexus.passport.com, DNS:messenger.hotmail.com, DNS:*.passport.com, DNS:*.passport.net
 EOF
 
-# Windows XP SP3 は SHA-256 署名・RSA 2048bit に対応している
-openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
-	-subj "/CN=LFM Root CA" \
-	-addext "basicConstraints=critical,CA:TRUE" \
-	-addext "keyUsage=critical,keyCertSign,cRLSign" \
-	-keyout ca/ca-key.pem -out ca/ca-cert.pem
+new_ca=false
+if $force || [ ! -e ca/ca-key.pem ]; then
+	# Windows XP SP3 は SHA-256 署名・RSA 2048bit に対応している
+	openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+		-subj "/CN=LFM Root CA" \
+		-addext "basicConstraints=critical,CA:TRUE" \
+		-addext "keyUsage=critical,keyCertSign,cRLSign" \
+		-keyout ca/ca-key.pem -out ca/ca-cert.pem
+	openssl x509 -in ca/ca-cert.pem -outform DER -out ca/ca-cert.cer
+	chmod 644 ca/ca-cert.pem ca/ca-cert.cer
+	new_ca=true
+fi
 
 openssl req -new -newkey rsa:2048 -sha256 -nodes \
 	-config "$tmp/server.cnf" \
@@ -58,9 +72,11 @@ openssl x509 -req -in "$tmp/server.csr" -sha256 -days 3650 \
 	-out "$tmp/server-cert.pem"
 
 cat "$tmp/server-cert.pem" ca/ca-cert.pem >certs/cert.pem
-openssl x509 -in ca/ca-cert.pem -outform DER -out ca/ca-cert.cer
-chmod 644 ca/ca-cert.pem ca/ca-cert.cer certs/cert.pem
+chmod 644 certs/cert.pem
 
 echo "Generated:"
-echo "  ca/ca-cert.cer  -> install on each client PC (Trusted Root Certification Authorities)"
+if $new_ca; then
+	echo "  ca/ca-cert.cer  -> NEW CA: install on each client PC (Trusted Root Certification Authorities)"
+	echo "                     and remove any older \"LFM Root CA\" there"
+fi
 echo "  certs/cert.pem, certs/key.pem -> used by stunnel (restart the server)"
