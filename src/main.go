@@ -67,6 +67,10 @@ func main() {
 	sb.NS = ns
 
 	ds := dispatch.New(dsAddr, nsPublicAddr)
+	ds.PublicAddr = publicHost + ":1863"
+	if _, port, err := net.SplitHostPort(dsAddr); err == nil && port != "" {
+		ds.PublicAddr = net.JoinHostPort(publicHost, port)
+	}
 	ps := passport.New("127.0.0.1:8080", store, tokens)
 
 	errCh := make(chan error, 5)

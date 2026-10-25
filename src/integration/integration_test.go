@@ -79,6 +79,7 @@ func newEnv(t *testing.T) *env {
 	sb.NS = ns
 	ps := passport.New(e.ppAddr, store, tokens)
 	ds := dispatch.New(e.dsAddr, e.nsAddr)
+	ds.PublicAddr = e.dsAddr
 	go sb.ListenAndServe()
 	go ns.ListenAndServe()
 	go ps.ListenAndServe()
@@ -722,7 +723,7 @@ func TestDispatchAcceptsAllSupportedClients(t *testing.T) {
 		c.cmd("CVR 0x0411 winnt 5.1 i386 MSNMSGR %s MSMSGS alice@test.com", v.client)
 		c.expect("CVR 2 " + v.client)
 		c.cmd("USR TWN I alice@test.com")
-		c.expect("XFR 3 NS " + e.nsAddr)
+		c.expect("XFR 3 NS " + e.nsAddr + " 0 " + e.dsAddr)
 	}
 }
 
@@ -758,4 +759,24 @@ func TestMSNP9ReceivesDisplayPicture(t *testing.T) {
 
 	alice.cmd("PNG")
 	alice.expect("QNG 60")
+}
+
+func TestGCFShields(t *testing.T) {
+	e := newEnv(t)
+	c := e.loginWithClientID("alice@test.com", "MSNP11", clientID70)
+	c.cmd("GCF Shields.xml")
+	line := c.expect("GCF 7 Shields.xml ")
+	f := strings.Fields(line)
+	n, _ := strconv.Atoi(f[len(f)-1])
+	buf := make([]byte, n)
+	_ = c.conn.SetReadDeadline(time.Now().Add(readTimeout))
+	if _, err := io.ReadFull(c.r, buf); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(buf), "<?xml") || !strings.HasSuffix(string(buf), "</config>") {
+		t.Fatalf("unexpected Shields.xml: %q", buf)
+	}
+	// ペイロードの後も通常のやり取りが続けられる
+	c.cmd("PNG")
+	c.expect("QNG")
 }

@@ -21,6 +21,10 @@ import (
 // writeTimeout は1回の送信の上限。応答しないクライアントに引きずられないようにする。
 const writeTimeout = 10 * time.Second
 
+// shieldsXML はGCFで返すShields設定。どのバージョン・機能も制限しない。
+const shieldsXML = `<?xml version="1.0" encoding="utf-8" ?>` +
+	`<config><shield><cli maj="7" min="0" minbld="0" maxbld="9999" deny=" " /></shield><block></block></config>`
+
 type Server struct {
 	ListenAddr      string
 	SwitchboardAddr string
@@ -498,6 +502,18 @@ func (s *Server) handleLine(sess *clientSession, line string) {
 	case "URL":
 		// Hotmail URL要求 - ダミーで返す
 		s.send(sess, fmt.Sprintf("URL %s 200 https://example.invalid/\r\n", trID))
+
+	case "GCF":
+		// MSNP11: 設定ファイルの要求(7.0はサインイン直後に Shields.xml を取りに来る)
+		// GCF trID name -> GCF trID name length\r\n<payload>
+		if len(parts) < 3 {
+			return
+		}
+		body := shieldsXML
+		if parts[2] != "Shields.xml" {
+			body = "<?xml version=\"1.0\" encoding=\"utf-8\" ?><config></config>"
+		}
+		s.send(sess, fmt.Sprintf("GCF %s %s %d\r\n%s", trID, parts[2], len(body), body))
 
 	default:
 		log.Printf("[NS] unhandled command: %s", cmd)
