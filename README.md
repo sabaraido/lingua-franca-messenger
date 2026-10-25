@@ -24,8 +24,8 @@ An MSN Messenger protocol emulator server that supports multiple MSNP versions (
 | MSN Messenger 5.0 (5.0.0575) | MSNP8 | ✅ Tested |
 | MSN Messenger 6.0 / 6.1 | MSNP9 | 🔄 Not yet tested on a real client |
 | MSN Messenger 6.2 (6.2.0205) | MSNP10 | ✅ Tested |
-| MSN Messenger 7.0 | MSNP11 | 🔄 Not yet tested on a real client |
-| MSN Messenger 7.5 | MSNP11 | 🔄 Not yet tested on a real client |
+| MSN Messenger 7.0 (7.0.0820) | MSNP11 | ✅ Tested |
+| MSN Messenger 7.5 (7.5.0324) | MSNP11 | ✅ Tested (sign-in via RST.srf) |
 
 Windows Live Messenger 8.0 and later (MSNP13+) use SOAP-based contact lists and are not supported. MSN Messenger 4.x and earlier (MSNP7 and below) are planned for later.
 
