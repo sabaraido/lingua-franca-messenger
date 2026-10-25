@@ -2,108 +2,139 @@ package passport
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"log"
-	"net/http"
+	"net"
 	"net/url"
 	"strings"
+	"time"
 
-	"github.com/BeYour-Studio/lingua-franca-messenger/src/core"
+	"github.com/sabaraido/lingua-franca-messenger/src/core"
 )
+
+// PassportTicketTTL はチケット発行からNSでの USR TWN S までの猶予。
+const PassportTicketTTL = 5 * time.Minute
 
 type Server struct {
 	ListenAddr string
 	Users      *core.UserStore
+	Tokens     *core.TokenStore
 }
 
-func New(listenAddr string, users *core.UserStore) *Server {
-	return &Server{ListenAddr: listenAddr, Users: users}
+func New(listenAddr string, users *core.UserStore, tokens *core.TokenStore) *Server {
+	return &Server{ListenAddr: listenAddr, Users: users, Tokens: tokens}
 }
 
 func (s *Server) ListenAndServe() error {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/rdr/pprdr.asp", s.handleNexus)
-	mux.HandleFunc("/login2.srf", s.handleLogin)
-
+	ln, err := net.Listen("tcp", s.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("passport: listen failed: %w", err)
+	}
 	log.Printf("[Passport] listening on %s (plain HTTP, behind stunnel)", s.ListenAddr)
-	return http.ListenAndServe(s.ListenAddr, mux)
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Printf("[Passport] accept error: %v", err)
+			continue
+		}
+		go s.handleConn(conn)
+	}
 }
 
-func (s *Server) handleNexus(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[Passport] Nexus request: %s %s", r.Method, r.URL.Path)
+func (s *Server) handleConn(conn net.Conn) {
+	defer conn.Close()
+	buf := make([]byte, 16384)
+	n, err := conn.Read(buf)
+	if err != nil || n == 0 {
+		return
+	}
+	request := string(buf[:n])
+	lines := strings.Split(request, "\r\n")
+	if len(lines) == 0 {
+		return
+	}
 
+	parts := strings.Fields(lines[0])
+	if len(parts) < 2 {
+		return
+	}
+	method := parts[0]
+	path := parts[1]
+	log.Printf("[Passport] request: %s %s from %s", method, path, conn.RemoteAddr())
+
+	// ヘッダーをパース
+	headers := make(map[string]string)
+	for _, line := range lines[1:] {
+		if line == "" {
+			break
+		}
+		kv := strings.SplitN(line, ": ", 2)
+		if len(kv) == 2 {
+			headers[strings.ToLower(kv[0])] = kv[1]
+		}
+	}
+
+	if strings.HasPrefix(path, "/rdr/pprdr.asp") {
+		s.handleNexus(conn)
+	} else if strings.HasPrefix(path, "/login2.srf") {
+		s.handleLogin(conn, headers["authorization"])
+	} else {
+		conn.Write([]byte("HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n"))
+	}
+}
+
+func (s *Server) handleNexus(conn net.Conn) {
 	passportURLs := "DARealm=Passport.Net," +
 		"DALogin=login.passport.com/login2.srf," +
-		"DAReg=http://register.passport.net/uixpwiz.srf," +
+		"DAReg=https://register.passport.net/uixpwiz.srf," +
 		"Properties=https://register.passport.net/editprof.srf," +
-		"Privacy=http://www.passport.com/consumer/privacypolicy.asp," +
-		"GeneralRedir=http://nexusrdr.passport.com/redir.asp," +
-		"Help=http://memberservices.passport.net/memberservice.srf," +
+		"Privacy=https://www.passport.com/consumer/privacypolicy.asp," +
+		"GeneralRedir=https://nexusrdr.passport.com/redir.asp," +
+		"Help=https://memberservices.passport.net/memberservice.srf," +
 		"ConfigVersion=11"
-
-	w.Header()["PassportURLs"] = []string{passportURLs}
-	w.Header().Set("Content-Type", "text/html")
-	w.Header().Set("Cache-control", "private")
-	w.Header().Set("Connection", "close")
-	w.Header().Set("Content-Length", "0")
-	w.WriteHeader(http.StatusOK)
+	log.Printf("[Passport] Nexus response: %s", passportURLs)
+	resp := "HTTP/1.0 200 OK\r\n" +
+		"PassportURLs: " + passportURLs + "\r\n" +
+		"Content-Type: text/html\r\n" +
+		"Cache-control: private\r\n" +
+		"Connection: close\r\n" +
+		"Content-Length: 0\r\n" +
+		"\r\n"
+	conn.Write([]byte(resp))
 }
 
-func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	auth := r.Header.Get("Authorization")
-	log.Printf("[Passport] Login request, Authorization=%s", auth)
-
+func (s *Server) handleLogin(conn net.Conn, auth string) {
+	// Authorizationヘッダーには平文パスワードが含まれるのでログに出さない
 	email, password := parseAuthorization(auth)
-        log.Printf("[Passport] Parsed: email=%q password=%q", email, password)
+	log.Printf("[Passport] Login request for %q", email)
 
 	if email == "" {
-		s.writeFailure(w, "missing sign-in")
+		conn.Write([]byte("HTTP/1.0 401 Unauthorized\r\nWWW-Authenticate: Passport1.4 da-status=failed\r\nContent-Length: 0\r\n\r\n"))
 		return
 	}
 
-        log.Printf("[Passport] Attempting auth for email=%q", email)
-	
-	// デバッグ: 手動でハッシュを計算してログ出力
-	{
-		h := sha256.Sum256([]byte(password))
-		log.Printf("[Passport] Computed hash for password=%q: %s", password, hex.EncodeToString(h[:]))
-	}
-	
-	_, ok := s.Users.Authenticate(email, password)
-	log.Printf("[Passport] Authenticate result: ok=%v", ok)
-
-	if !ok {
+	if !s.Users.Authenticate(email, password) {
 		log.Printf("[Passport] authentication failed for %s", email)
-		s.writeFailure(w, "invalid credentials")
+		conn.Write([]byte("HTTP/1.0 401 Unauthorized\r\nWWW-Authenticate: Passport1.4 da-status=failed,cbtxt=invalid+credentials\r\nContent-Length: 0\r\n\r\n"))
 		return
 	}
 
-	ticket := "from-PP=" + randomHex(16)
+	ticket := "t=" + randomHex(32) + "&p=" + randomHex(32)
+	s.Tokens.Put(ticket, email, core.ScopePassport, PassportTicketTTL)
 	authInfo := fmt.Sprintf(
-		"Passport1.4 da-status=success,tname=PPAuth,%s,ru=http://messenger.msn.com",
+		"Passport1.4 da-status=success,tname=MSPAuth,from-PP='%s',ru=http://messenger.msn.com",
 		ticket,
 	)
-
-	w.Header().Set("Authentication-Info", authInfo)
-	w.Header().Set("Content-Length", "0")
-        w.Header().Set("Connection", "close")
-	w.WriteHeader(http.StatusOK)
+	resp := "HTTP/1.0 200 OK\r\n" +
+		"Authentication-Info: " + authInfo + "\r\n" +
+		"Content-Length: 0\r\n" +
+		"Connection: close\r\n" +
+		"\r\n"
+	log.Printf("[Passport] Login success for %s", email)
+	conn.Write([]byte(resp))
 }
 
-func (s *Server) writeFailure(w http.ResponseWriter, reason string) {
-	authInfo := fmt.Sprintf(
-		"Passport1.4 da-status=failed,cbtxt=%s",
-		url.QueryEscape(reason),
-	)
-	w.Header().Set("WWW-Authenticate", authInfo)
-	w.Header().Set("Content-Length", "0")
-	w.WriteHeader(http.StatusUnauthorized)
-}
-
-// parseAuthorization は "Passport1.4 OrgVerb=...,sign-in=...,pwd=...,..." から
-// sign-inとpwdを取り出す。
 func parseAuthorization(auth string) (email, password string) {
 	auth = strings.TrimPrefix(auth, "Passport1.4 ")
 	fields := strings.Split(auth, ",")

@@ -1,0 +1,27 @@
+FROM debian:bookworm AS openssl-legacy
+RUN apt-get update && apt-get install -y build-essential wget perl
+WORKDIR /build
+RUN wget -O openssl-1.0.2u.tar.gz https://github.com/openssl/openssl/archive/refs/tags/OpenSSL_1_0_2u.tar.gz \
+    && tar xzf openssl-1.0.2u.tar.gz
+WORKDIR /build/openssl-OpenSSL_1_0_2u
+RUN ./config enable-ssl2 enable-ssl3 enable-ssl3-method shared --prefix=/opt/openssl-legacy \
+    && make -j$(nproc) \
+    && make install_sw
+
+FROM debian:bookworm AS stunnel-build
+RUN apt-get update && apt-get install -y build-essential wget
+COPY --from=openssl-legacy /opt/openssl-legacy /opt/openssl-legacy
+WORKDIR /build
+RUN wget https://www.stunnel.org/downloads/archive/5.x/stunnel-5.63.tar.gz \
+    && tar xzf stunnel-5.63.tar.gz
+WORKDIR /build/stunnel-5.63
+RUN ./configure --with-ssl=/opt/openssl-legacy --prefix=/opt/stunnel \
+    && make -j$(nproc) \
+    && make install
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates openssl \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=openssl-legacy /opt/openssl-legacy /opt/openssl-legacy
+COPY --from=stunnel-build /opt/stunnel /opt/stunnel
+ENV LD_LIBRARY_PATH=/opt/openssl-legacy/lib
