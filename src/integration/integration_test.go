@@ -235,14 +235,33 @@ func (e *env) connect(email, ver string) *client {
 
 // login はログインし、コンタクトリストを受け取ってオンライン(NLN)になる。
 func (e *env) login(email, ver string) *client {
+	return e.loginWithClientID(email, ver, "0")
+}
+
+// clientID70 は MSN Messenger 7.0 相当の clientid (MSNC4)。
+const clientID70 = "1073741860"
+
+func (e *env) loginWithClientID(email, ver, clientID string) *client {
 	c := e.connect(email, ver)
 	c.cmd("USR TWN S %s", e.ticket(email))
 	c.expect("USR " + strconv.Itoa(c.tr) + " OK")
-	c.cmd("SYN 0")
+	c.cmd("SYN 0 0")
 	c.expect("SYN")
-	c.cmd("CHG NLN 0")
+	c.cmd("CHG NLN %s", clientID)
 	c.expect("CHG")
 	return c
+}
+
+// lines は空行が来るまでの行を集める(SYNの応答全体を見るため)。
+func (c *client) linesUntilQuiet() []string {
+	var out []string
+	for {
+		line, _, err := c.readLine(quietPeriod)
+		if err != nil {
+			return out
+		}
+		out = append(out, line)
+	}
 }
 
 func TestForgedTicketRejected(t *testing.T) {
@@ -481,4 +500,200 @@ func TestSwitchboardRejectsInvalidKey(t *testing.T) {
 	c.cmd("USR bob@test.com deadbeef")
 	c.expect("911")
 	c.expectClosed()
+}
+
+func TestSyncMSNP10Format(t *testing.T) {
+	e := newEnv(t)
+	g, err := e.store.AddGroup("bob@test.com", "Friends")
+	if err != nil {
+		t.Fatal(err)
+	}
+	guid := e.store.GetContactGUID("bob@test.com", "alice@test.com")
+	if err := e.store.SetContactGroups("bob@test.com", guid, []string{g.GUID}); err != nil {
+		t.Fatal(err)
+	}
+
+	c := e.connect("bob@test.com", "MSNP10")
+	c.cmd("USR TWN S %s", e.ticket("bob@test.com"))
+	c.expect("USR 4 OK bob@test.com 1 0")
+	c.cmd("SYN 0 0")
+	syn := strings.Fields(c.expect("SYN 5 "))
+	// SYN trID timestamp timestamp lstCount lsgCount
+	if len(syn) != 6 || !strings.Contains(syn[2], "T") || syn[4] != "1" || syn[5] != "1" {
+		t.Fatalf("unexpected SYN: %v", syn)
+	}
+	c.expect("LSG Friends " + g.GUID)
+	c.expect("LST N=alice@test.com F=Alice%20A C=" + guid + " 11 " + g.GUID)
+}
+
+func TestGroupsAcrossVersions(t *testing.T) {
+	e := newEnv(t)
+
+	// 6.2相当(MSNP10)でグループを作って alice を入れる
+	bob := e.login("bob@test.com", "MSNP10")
+	bob.cmd("ADG Work%%20Mates")
+	adg := strings.Fields(bob.expect("ADG 7 Work%20Mates "))
+	groupGUID := adg[3]
+	bob.cmd("ADG Work%%20Mates")
+	bob.expect("228") // 同名のグループ
+	aliceGUID := e.store.GetContactGUID("bob@test.com", "alice@test.com")
+	bob.cmd("ADC FL C=%s %s", aliceGUID, groupGUID)
+	bob.expect("ADC 9 FL C=" + aliceGUID + " " + groupGUID)
+	bob.cmd("ADC FL C=%s 00000000-dead-beef-0000-000000000000", aliceGUID)
+	bob.expect("224") // 存在しないグループ
+	bob.conn.Close()
+
+	// 同じリストを5.0相当(MSNP8)で見ると、グループは番号になる
+	c := e.connect("bob@test.com", "MSNP8")
+	c.cmd("USR TWN S %s", e.ticket("bob@test.com"))
+	c.expect("USR 4 OK")
+	c.cmd("SYN 0")
+	c.expect("SYN 5 ")
+	c.expect("LSG 0 Other%20Contacts 0")
+	c.expect("LSG 1 Work%20Mates 0")
+	c.expect("LST alice@test.com Alice%20A 11 1")
+
+	// MSNP8: グループ0にも追加 -> グループ1から外す -> グループ0だけに残る
+	c.cmd("ADD FL alice@test.com Alice 0")
+	c.expect("ADD 6 FL ")
+	c.cmd("REM FL alice@test.com 1")
+	c.expect("REM 7 FL ")
+	if !e.store.HasList("bob@test.com", "alice@test.com", "FL") {
+		t.Fatal("alice should stay in FL (still in group 0)")
+	}
+	// 名前変更と削除
+	c.cmd("REG 1 Coworkers 0")
+	c.expect("REG 8 ")
+	c.cmd("RMG 0")
+	c.expect("230") // グループ0は消せない
+	c.cmd("RMG 1")
+	c.expect("RMG 10 ")
+	if len(e.store.Groups("bob@test.com")) != 0 {
+		t.Fatal("group should be removed")
+	}
+	// 最後のグループから外すとFLから消える
+	c.cmd("REM FL alice@test.com 0")
+	c.expect("REM 11 FL ")
+	if e.store.HasList("bob@test.com", "alice@test.com", "FL") {
+		t.Fatal("alice should be removed from FL")
+	}
+}
+
+func TestPersonalMessageOnlyForMSNP11(t *testing.T) {
+	e := newEnv(t)
+	if err := e.store.AddUser("dave@test.com", "pw", "Dave"); err != nil {
+		t.Fatal(err)
+	}
+	befriend(t, e.store, "dave@test.com", "alice@test.com")
+	befriend(t, e.store, "dave@test.com", "bob@test.com")
+
+	alice := e.login("alice@test.com", "MSNP8")
+	bob := e.login("bob@test.com", "MSNP10")
+	dave := e.loginWithClientID("dave@test.com", "MSNP11", clientID70)
+	alice.expect("NLN NLN dave@test.com Dave " + clientID70)
+	bob.expect("NLN NLN dave@test.com Dave " + clientID70)
+
+	psm := "<Data><PSM>こんにちは</PSM><CurrentMedia></CurrentMedia></Data>"
+	dave.tr++
+	dave.raw(fmt.Sprintf("UUX %d %d\r\n%s", dave.tr, len(psm), psm))
+	dave.expect(fmt.Sprintf("UUX %d 0", dave.tr))
+	// 6.2 / 5.0 は UBX を知らないので送らない
+	alice.expectNone("UBX")
+	bob.expectNone("UBX")
+
+	// 後からログインした 7.0 相当のコンタクトには ILN の後に UBX が届く
+	if err := e.store.AddUser("erin@test.com", "pw", "Erin"); err != nil {
+		t.Fatal(err)
+	}
+	befriend(t, e.store, "erin@test.com", "dave@test.com")
+	erin := e.loginWithClientID("erin@test.com", "MSNP11", clientID70)
+	erin.expect("ILN 6 NLN dave@test.com Dave " + clientID70)
+	if _, body := erin.expectUBX("dave@test.com"); body != psm {
+		t.Fatalf("erin got PSM %q", body)
+	}
+
+	// 変更はオンラインの 7.0 相当のコンタクトにだけ届く
+	psm2 := "<Data><PSM>bye</PSM><CurrentMedia></CurrentMedia></Data>"
+	dave.tr++
+	dave.raw(fmt.Sprintf("UUX %d %d\r\n%s", dave.tr, len(psm2), psm2))
+	if _, body := erin.expectUBX("dave@test.com"); body != psm2 {
+		t.Fatalf("erin got PSM %q", body)
+	}
+	alice.expectNone("UBX")
+}
+
+// expectUBX は UBX email length\r\n<payload> を読む。
+func (c *client) expectUBX(email string) (string, string) {
+	c.t.Helper()
+	line := c.expect("UBX " + email + " ")
+	f := strings.Fields(line)
+	n, _ := strconv.Atoi(f[len(f)-1])
+	buf := make([]byte, n)
+	_ = c.conn.SetReadDeadline(time.Now().Add(readTimeout))
+	if _, err := io.ReadFull(c.r, buf); err != nil {
+		c.t.Fatalf("%s: read UBX payload: %v", c.name, err)
+	}
+	return line, string(buf)
+}
+
+func TestNudgeIsTranslatedForOldClients(t *testing.T) {
+	e := newEnv(t)
+	if err := e.store.AddUser("dave@test.com", "pw", "Dave"); err != nil {
+		t.Fatal(err)
+	}
+	befriend(t, e.store, "dave@test.com", "alice@test.com")
+	befriend(t, e.store, "dave@test.com", "bob@test.com")
+
+	alice := e.login("alice@test.com", "MSNP8")
+	bob := e.loginWithClientID("bob@test.com", "MSNP10", "805306404") // 6.2 (MSNC3)
+	dave := e.loginWithClientID("dave@test.com", "MSNP11", clientID70)
+
+	// 7.0相当の dave が会話を始めて 5.0 / 6.2 相当の2人を招待する
+	dave.cmd("XFR SB")
+	cki := strings.Fields(dave.expect("XFR"))[5]
+	dsb := dial(t, "dave/sb", e.sbAddr)
+	dsb.cmd("USR dave@test.com %s", cki)
+	dsb.expect("USR 1 OK")
+	var members []*client
+	for _, invitee := range []*client{alice, bob} {
+		dsb.cmd("CAL %s", strings.Split(invitee.name, "/")[0])
+		sid := strings.Fields(dsb.expect("CAL"))[3]
+		rng := strings.Fields(invitee.expect("RNG " + sid))
+		sb := dial(t, invitee.name+"/sb", e.sbAddr)
+		sb.cmd("ANS %s %s %s", strings.Split(invitee.name, "/")[0], rng[4], sid)
+		sb.expect("ANS 1 OK")
+		members = append(members, sb)
+	}
+
+	nudge := "MIME-Version: 1.0\r\nContent-Type: text/x-msnmsgr-datacast\r\n\r\nID: 1\r\n\r\n\r\n"
+	dsb.tr++
+	dsb.raw(fmt.Sprintf("MSG %d N %d\r\n%s", dsb.tr, len(nudge), nudge))
+	for _, m := range members {
+		_, body := m.expectMSG("MSG dave@test.com Dave")
+		if !strings.Contains(body, "text/plain") || !strings.HasSuffix(body, "（ナッジを送りました）") {
+			t.Fatalf("%s got %q", m.name, body)
+		}
+	}
+
+	// 普通のテキストはそのまま届く
+	text := "MIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\nhi"
+	dsb.tr++
+	dsb.raw(fmt.Sprintf("MSG %d N %d\r\n%s", dsb.tr, len(text), text))
+	for _, m := range members {
+		if _, body := m.expectMSG("MSG dave@test.com Dave"); body != text {
+			t.Fatalf("%s got %q", m.name, body)
+		}
+	}
+}
+
+func TestMSNP11Login(t *testing.T) {
+	e := newEnv(t)
+	c := e.connect("alice@test.com", "MSNP11 MSNP10")
+	c.cmd("USR TWN S %s", e.ticket("alice@test.com"))
+	c.expect("USR 4 OK alice@test.com 1 0")
+	c.cmd("SYN 0 0")
+	c.expect("SYN 5 ")
+	c.cmd("CHG NLN %s %%3Cmsnobj%%2F%%3E", clientID70)
+	// MSNP11 では clientid と MSNObject もそのまま返す
+	c.expect("CHG 6 NLN " + clientID70 + " %3Cmsnobj%2F%3E")
 }

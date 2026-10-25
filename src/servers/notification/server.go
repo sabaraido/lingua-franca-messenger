@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/url"
@@ -19,6 +20,14 @@ import (
 
 // writeTimeout は1回の送信の上限。応答しないクライアントに引きずられないようにする。
 const writeTimeout = 10 * time.Second
+
+// supportedProtocols は対応しているMSNPバージョンと、その番号。
+var supportedProtocols = map[string]int{
+	"MSNP8":  8,
+	"MSNP9":  9,
+	"MSNP10": 10,
+	"MSNP11": 11,
+}
 
 type Server struct {
 	ListenAddr      string
@@ -42,14 +51,17 @@ type clientSession struct {
 	conn net.Conn
 	wmu  sync.Mutex // 同じ接続への書き込みが混ざらないようにする
 
-	msnpVersion  string
+	msnpVersion  string // VERで決めたバージョン("MSNP8" など)
+	proto        int    // msnpVersion の番号部分(8, 9, 10, 11)
 	pendingEmail string // USR TWN I で名乗ったアドレス(未認証)
 	userEmail    string // 認証済みのアドレス。チケット照合に成功するまで空
 	friendlyName string
 	status       string
 	capabilities string
 	msnobj       string
-	superseded   bool // 別の場所からログインされた(切断時にFLNを送らない)
+	// personalMessage はMSNP11のUUXで設定されたパーソナルメッセージ(<Data>...</Data>)
+	personalMessage string
+	superseded      bool // 別の場所からログインされた(切断時にFLNを送らない)
 }
 
 // outgoing は送信予定のメッセージ。ロックを外してから送るために使う。
@@ -70,13 +82,15 @@ func New(listenAddr, sbAddr string, users *core.UserStore, tokens *core.TokenSto
 	return s
 }
 
-func (sess *clientSession) isMSNP8() bool {
-	return sess.msnpVersion == "MSNP8"
+// usesListVersions はMSNP8/9形式のコンタクトリストを使うか。
+// ADD/REM/BLP/GTCなどの応答にリストのバージョン番号が付き、グループは番号で表す。
+func (sess *clientSession) usesListVersions() bool {
+	return sess.proto <= 9
 }
 
-// usesListVersions はADD/REM/BLP/GTCなどの応答にリストのバージョン番号が付くか(MSNP8/9)。
-func (sess *clientSession) usesListVersions() bool {
-	return sess.msnpVersion != "MSNP10"
+// supportsMSNObject は在席通知にMSNObject(表示画像など)を付けられるか(MSNP9以降)。
+func (sess *clientSession) supportsMSNObject() bool {
+	return sess.proto >= 9
 }
 
 // visible は他のユーザーからオンラインに見える状態か。
@@ -116,7 +130,7 @@ func presenceArgs(target, receiver *clientSession) string {
 		caps = "0"
 	}
 	args := fmt.Sprintf("%s %s %s %s", target.status, target.userEmail, escapeName(target.friendlyName), caps)
-	if target.msnobj != "" && !receiver.isMSNP8() {
+	if target.msnobj != "" && receiver.supportsMSNObject() {
 		args += " " + target.msnobj
 	}
 	return args
@@ -170,9 +184,19 @@ func (s *Server) presenceForLocked(target, viewer *clientSession) string {
 		return ""
 	}
 	if target.visible() && s.allows(target.userEmail, viewer.userEmail) {
-		return fmt.Sprintf("NLN %s\r\n", presenceArgs(target, viewer))
+		return fmt.Sprintf("NLN %s\r\n", presenceArgs(target, viewer)) + ubxLocked(target, viewer)
 	}
 	return fmt.Sprintf("FLN %s\r\n", target.userEmail)
+}
+
+// ubxLocked は target のパーソナルメッセージ(UUXで設定したもの)を viewer 向けのUBXにする。
+// UBXを知っているのはMSNP11以降だけなので、それより古いクライアントには何も送らない。
+// 呼び出し側で mu を保持すること。
+func ubxLocked(target, viewer *clientSession) string {
+	if viewer.proto < 11 || target.personalMessage == "" {
+		return ""
+	}
+	return fmt.Sprintf("UBX %s %d\r\n%s", target.userEmail, len(target.personalMessage), target.personalMessage)
 }
 
 // broadcastPresence は sess を FL に入れている全オンラインユーザーへ、
@@ -253,8 +277,76 @@ func (s *Server) handleConn(conn net.Conn) {
 			continue
 		}
 		log.Printf("[NS] << %s: %s", remote, line)
+
+		// ペイロード付きコマンド: CMD trID ... length\r\n<length bytes>
+		if parts := strings.Fields(line); len(parts) >= 3 && payloadCommands[parts[0]] {
+			n, err := strconv.Atoi(parts[len(parts)-1])
+			if err != nil || n < 0 || n > maxPayload {
+				log.Printf("[NS] invalid payload length in %q, closing", line)
+				return
+			}
+			payload := make([]byte, n)
+			if _, err := io.ReadFull(reader, payload); err != nil {
+				log.Printf("[NS] failed to read payload: %v", err)
+				return
+			}
+			s.handlePayloadCommand(sess, parts, payload)
+			continue
+		}
 		s.handleLine(sess, line)
 	}
+}
+
+// payloadCommands は、行の後ろに長さ指定のペイロードが続くクライアント側コマンド。
+var payloadCommands = map[string]bool{
+	"UUX": true, // MSNP11: パーソナルメッセージ・再生中の曲
+	"QRY": true, // CHLへの応答
+}
+
+const maxPayload = 8 * 1024
+
+func (s *Server) handlePayloadCommand(sess *clientSession, parts []string, payload []byte) {
+	trID := parts[1]
+	if sess.userEmail == "" {
+		log.Printf("[NS] %s before authentication, closing", parts[0])
+		sess.conn.Close()
+		return
+	}
+	switch parts[0] {
+	case "UUX":
+		// UUX trID length\r\n<Data><PSM>...</PSM><CurrentMedia>...</CurrentMedia></Data>
+		pm := string(payload)
+		var changed bool
+		s.update(func() {
+			changed = sess.personalMessage != pm
+			sess.personalMessage = pm
+		})
+		s.send(sess, fmt.Sprintf("UUX %s 0\r\n", trID))
+		if changed && sess.visible() {
+			s.broadcastPersonalMessage(sess)
+		}
+	case "QRY":
+		// こちらからCHLは送らないが、届いた場合は受理だけする
+		s.send(sess, fmt.Sprintf("QRY %s\r\n", trID))
+	}
+}
+
+// broadcastPersonalMessage は sess のパーソナルメッセージを、見える相手(MSNP11以降)にUBXで送る。
+func (s *Server) broadcastPersonalMessage(sess *clientSession) {
+	var msgs []outgoing
+	s.mu.RLock()
+	for other := range s.sessions {
+		if other == sess || other.superseded || other.userEmail == "" || other.proto < 11 {
+			continue
+		}
+		if s.Users.HasList(other.userEmail, sess.userEmail, "FL") && s.allows(sess.userEmail, other.userEmail) {
+			if ubx := ubxLocked(sess, other); ubx != "" {
+				msgs = append(msgs, outgoing{other, ubx})
+			}
+		}
+	}
+	s.mu.RUnlock()
+	s.sendAll(msgs)
 }
 
 func (s *Server) handleLine(sess *clientSession, line string) {
@@ -281,11 +373,11 @@ func (s *Server) handleLine(sess *clientSession, line string) {
 
 	switch cmd {
 	case "VER":
-		supported := map[string]bool{"MSNP8": true, "MSNP9": true, "MSNP10": true}
-		chosen := ""
+		// クライアントの提示順(新しい順)に、対応している最初のバージョンを選ぶ
+		chosen, proto := "", 0
 		for _, v := range parts[2:] {
-			if supported[v] {
-				chosen = v
+			if n, ok := supportedProtocols[v]; ok {
+				chosen, proto = v, n
 				break
 			}
 		}
@@ -293,7 +385,7 @@ func (s *Server) handleLine(sess *clientSession, line string) {
 			sess.conn.Close()
 			return
 		}
-		s.update(func() { sess.msnpVersion = chosen })
+		s.update(func() { sess.msnpVersion, sess.proto = chosen, proto })
 		s.send(sess, fmt.Sprintf("VER %s %s CVR0\r\n", trID, chosen))
 
 	case "CVR":
@@ -316,7 +408,7 @@ func (s *Server) handleLine(sess *clientSession, line string) {
 		if len(parts) >= 3 {
 			clientVer, _ = strconv.ParseInt(parts[2], 10, 64)
 		}
-		if sess.isMSNP8() {
+		if sess.usesListVersions() {
 			s.syncMSNP8(sess, trID, clientVer)
 		} else {
 			s.syncMSNP10(sess, trID)
@@ -333,6 +425,15 @@ func (s *Server) handleLine(sess *clientSession, line string) {
 
 	case "REM":
 		s.handleREM(sess, parts, trID)
+
+	case "ADG":
+		s.handleADG(sess, parts, trID)
+
+	case "RMG":
+		s.handleRMG(sess, parts, trID)
+
+	case "REG":
+		s.handleREG(sess, parts, trID)
 
 	case "BLP":
 		// プライバシー設定: BLP trID AL|BL
@@ -368,7 +469,7 @@ func (s *Server) handleLine(sess *clientSession, line string) {
 		s.send(sess, fmt.Sprintf("XFR %s SB %s CKI %s\r\n", trID, s.SwitchboardAddr, sessionKey))
 
 	case "PNG":
-		if sess.isMSNP8() {
+		if sess.proto < 9 {
 			// 次回PNGまでの秒数はMSNP9から
 			s.send(sess, "QNG\r\n")
 		} else {
@@ -469,7 +570,7 @@ func (s *Server) handleUSR(sess *clientSession, parts []string, trID string) {
 			other.conn.Close()
 		}
 
-		if sess.msnpVersion == "MSNP10" {
+		if sess.proto >= 10 {
 			s.send(sess, fmt.Sprintf("USR %s OK %s 1 0\r\n", trID, sess.userEmail))
 		} else {
 			// MSNP8/9: USR trID OK email friendlyname verified 0
@@ -505,13 +606,17 @@ func (s *Server) handleCHG(sess *clientSession, parts []string, trID string) {
 		sess.status, sess.capabilities, sess.msnobj = status, caps, msnobj
 	})
 
-	if sess.isMSNP8() {
+	switch {
+	case sess.proto == 8:
 		// MSNP8: CHG trID status clientid
 		if caps == "" {
 			caps = "0"
 		}
 		s.send(sess, fmt.Sprintf("CHG %s %s %s\r\n", trID, status, caps))
-	} else {
+	case sess.proto >= 11:
+		// MSNP11: クライアントが送った clientid と MSNObject をそのまま返す
+		s.send(sess, fmt.Sprintf("CHG %s %s\r\n", trID, strings.Join(parts[2:], " ")))
+	default:
 		s.send(sess, fmt.Sprintf("CHG %s %s\r\n", trID, status))
 	}
 
@@ -525,7 +630,7 @@ func (s *Server) handleCHG(sess *clientSession, parts []string, trID string) {
 				continue
 			}
 			if s.Users.HasList(sess.userEmail, other.userEmail, "FL") && s.allows(other.userEmail, sess.userEmail) {
-				msgs = append(msgs, outgoing{sess, fmt.Sprintf("ILN %s %s\r\n", trID, presenceArgs(other, sess))})
+				msgs = append(msgs, outgoing{sess, fmt.Sprintf("ILN %s %s\r\n", trID, presenceArgs(other, sess)) + ubxLocked(other, sess)})
 			}
 		}
 		s.mu.RUnlock()
@@ -535,175 +640,6 @@ func (s *Server) handleCHG(sess *clientSession, parts []string, trID string) {
 	// 初回の非表示ログインは誰にも知らせる必要がない
 	if changed && !(first && !sess.visible()) {
 		s.broadcastPresence(sess)
-	}
-}
-
-// handleADC はMSNP10のコンタクト追加: ADC trID list N=email [F=name] / ADC trID FL C=guid group
-func (s *Server) handleADC(sess *clientSession, parts []string, trID string) {
-	if len(parts) < 4 {
-		return
-	}
-	listType := parts[2]
-	if strings.HasPrefix(parts[3], "C=") {
-		// 既存コンタクトのグループ追加。グループは1つだけなのでそのまま返す
-		s.send(sess, fmt.Sprintf("ADC %s %s\r\n", trID, strings.Join(parts[2:], " ")))
-		return
-	}
-	email := strings.TrimPrefix(parts[3], "N=")
-	friendlyName := ""
-	if len(parts) >= 5 {
-		friendlyName, _ = url.QueryUnescape(strings.TrimPrefix(parts[4], "F="))
-	}
-	friendlyName = s.resolveFriendlyName(email, friendlyName)
-
-	s.addToList(sess, listType, email, friendlyName)
-	if listType == "FL" {
-		// FL追加の場合はALにも追加
-		s.addToList(sess, "AL", email, friendlyName)
-	}
-	guid := s.Users.GetContactGUID(sess.userEmail, email)
-	s.send(sess, fmt.Sprintf("ADC %s %s N=%s F=%s C=%s\r\n",
-		trID, listType, email, escapeName(friendlyName), guid))
-
-	if listType == "FL" {
-		s.sendContactPresence(sess, email, "")
-	}
-}
-
-// handleADD はMSNP8/9のコンタクト追加: ADD trID list email friendlyname [group]
-//
-//	-> ADD trID list version email friendlyname [group]
-func (s *Server) handleADD(sess *clientSession, parts []string, trID string) {
-	if len(parts) < 5 {
-		return
-	}
-	listType := parts[2]
-	email := parts[3]
-	friendlyName, _ := url.QueryUnescape(parts[4])
-	friendlyName = s.resolveFriendlyName(email, friendlyName)
-
-	s.addToList(sess, listType, email, friendlyName)
-
-	resp := fmt.Sprintf("ADD %s %s %d %s %s", trID, listType, s.nextListVersion(), email, escapeName(friendlyName))
-	if listType == "FL" {
-		group := "0"
-		if len(parts) >= 6 {
-			group = parts[5]
-		}
-		resp += " " + group
-	}
-	s.send(sess, resp+"\r\n")
-
-	if listType == "FL" {
-		s.sendContactPresence(sess, email, trID)
-	}
-}
-
-// addToList はコンタクトをリストに追加し、FLなら相手のRLを、AL/BLなら相手から見た在席状態を更新する。
-func (s *Server) addToList(sess *clientSession, listType, email, friendlyName string) {
-	if err := s.Users.AddContact(sess.userEmail, email, friendlyName, listType); err != nil {
-		log.Printf("[NS] add %s to %s: %v", email, listType, err)
-		return
-	}
-	switch listType {
-	case "FL":
-		s.updateReverseList(sess, email, true)
-	case "AL", "BL":
-		s.refreshPresenceFor(sess, email)
-	}
-}
-
-// updateReverseList は相手のRL(自分をFLに入れている人の一覧)を更新し、相手がオンラインなら知らせる。
-func (s *Server) updateReverseList(sess *clientSession, email string, added bool) {
-	if _, ok := s.Users.Get(email); !ok {
-		return
-	}
-	var err error
-	if added {
-		if s.Users.HasList(email, sess.userEmail, "RL") {
-			return
-		}
-		err = s.Users.AddContact(email, sess.userEmail, sess.friendlyName, "RL")
-	} else {
-		if !s.Users.HasList(email, sess.userEmail, "RL") {
-			return
-		}
-		err = s.Users.RemoveContact(email, sess.userEmail, "RL")
-	}
-	if err != nil {
-		log.Printf("[NS] update RL of %s: %v", email, err)
-		return
-	}
-
-	var msgs []outgoing
-	s.mu.RLock()
-	if target := s.sessionForLocked(email); target != nil {
-		var msg string
-		switch {
-		case added && target.usesListVersions():
-			msg = fmt.Sprintf("ADD 0 RL %d %s %s\r\n", s.nextListVersion(), sess.userEmail, escapeName(sess.friendlyName))
-		case added:
-			msg = fmt.Sprintf("ADC 0 RL N=%s F=%s\r\n", sess.userEmail, escapeName(sess.friendlyName))
-		case target.usesListVersions():
-			msg = fmt.Sprintf("REM 0 RL %d %s\r\n", s.nextListVersion(), sess.userEmail)
-		default:
-			msg = fmt.Sprintf("REM 0 RL %s\r\n", sess.userEmail)
-		}
-		msgs = append(msgs, outgoing{target, msg})
-	}
-	s.mu.RUnlock()
-	s.sendAll(msgs)
-}
-
-// sendContactPresence はFLに追加した相手がオンラインなら、その在席状態を知らせる。
-// trIDが空ならNLN、そうでなければILN(MSNP8のADDへの応答)で送る。
-func (s *Server) sendContactPresence(sess *clientSession, email, trID string) {
-	var msgs []outgoing
-	s.mu.RLock()
-	if other := s.sessionForLocked(email); other != nil && other.visible() && s.allows(other.userEmail, sess.userEmail) {
-		if trID == "" {
-			msgs = append(msgs, outgoing{sess, fmt.Sprintf("NLN %s\r\n", presenceArgs(other, sess))})
-		} else {
-			msgs = append(msgs, outgoing{sess, fmt.Sprintf("ILN %s %s\r\n", trID, presenceArgs(other, sess))})
-		}
-	}
-	s.mu.RUnlock()
-	s.sendAll(msgs)
-}
-
-func (s *Server) handleREM(sess *clientSession, parts []string, trID string) {
-	if len(parts) < 4 {
-		return
-	}
-	listType := parts[2]
-	emailOrGUID := parts[3]
-
-	// MSNP10: REM trID FL guid group はグループからの削除だけ(グループは1つなのでそのまま返す)
-	groupOnly := listType == "FL" && len(parts) >= 5 && !sess.usesListVersions()
-	if !groupOnly {
-		email := s.Users.ResolveContactEmail(sess.userEmail, emailOrGUID)
-		if err := s.Users.RemoveContact(sess.userEmail, emailOrGUID, listType); err != nil {
-			log.Printf("[NS] REM: failed to remove contact: %v", err)
-		}
-		if email != "" {
-			switch listType {
-			case "FL":
-				s.updateReverseList(sess, email, false)
-			case "AL", "BL":
-				s.refreshPresenceFor(sess, email)
-			}
-		}
-	}
-
-	if sess.usesListVersions() {
-		// MSNP8: REM trID list version email [group]
-		resp := fmt.Sprintf("REM %s %s %d %s", trID, listType, s.nextListVersion(), emailOrGUID)
-		if len(parts) >= 5 {
-			resp += " " + parts[4]
-		}
-		s.send(sess, resp+"\r\n")
-	} else {
-		s.send(sess, fmt.Sprintf("REM %s %s\r\n", trID, strings.Join(parts[2:], " ")))
 	}
 }
 
@@ -722,65 +658,6 @@ func (s *Server) setFriendlyName(sess *clientSession, name string) {
 	}
 	if sess.visible() {
 		s.broadcastPresence(sess)
-	}
-}
-
-func listBits(c core.Contact) int {
-	listNums := map[string]int{"FL": 1, "AL": 2, "BL": 4, "RL": 8}
-	bits := 0
-	for _, l := range c.Lists {
-		bits |= listNums[l]
-	}
-	return bits
-}
-
-// syncMSNP8 はMSNP8形式でコンタクトリストを送る。
-//
-//	SYN trID version lstCount lsgCount
-//	GTC A / BLP AL
-//	LSG 0 Other%20Contacts 0
-//	LST email friendlyname listBits [groups]   (groupsはFLに入っている場合のみ)
-//
-// ILNはSYNではなく、最初のCHGへの応答として送る。
-func (s *Server) syncMSNP8(sess *clientSession, trID string, clientVer int64) {
-	contacts := s.Users.GetContacts(sess.userEmail)
-	ver := s.syncListVersion(clientVer)
-	msgs := []string{
-		fmt.Sprintf("SYN %s %d %d 1\r\n", trID, ver, len(contacts)),
-		"GTC A\r\n",
-		fmt.Sprintf("BLP %s\r\n", s.Users.Privacy(sess.userEmail)),
-		"LSG 0 Other%20Contacts 0\r\n",
-	}
-	for _, c := range contacts {
-		bits := listBits(c)
-		line := fmt.Sprintf("LST %s %s %d", c.Email, escapeName(s.resolveFriendlyName(c.Email, c.FriendlyName)), bits)
-		if bits&1 != 0 {
-			line += " 0"
-		}
-		msgs = append(msgs, line+"\r\n")
-	}
-	for _, m := range msgs {
-		s.send(sess, m)
-	}
-}
-
-// syncMSNP10 は6.2で動作確認済みの形式でコンタクトリストを送る。
-// ILNはMSNP8と同様に最初のCHGへの応答として送る。
-func (s *Server) syncMSNP10(sess *clientSession, trID string) {
-	contacts := s.Users.GetContacts(sess.userEmail)
-	msgs := []string{
-		fmt.Sprintf("SYN %s 100 %d 1\r\n", trID, len(contacts)),
-		"GTC A\r\n",
-		fmt.Sprintf("BLP %s\r\n", s.Users.Privacy(sess.userEmail)),
-		fmt.Sprintf("PRP MFN %s\r\n", escapeName(sess.friendlyName)),
-		"LSG 0 Other%20Contacts 0\r\n",
-	}
-	for _, c := range contacts {
-		msgs = append(msgs, fmt.Sprintf("LST N=%s F=%s C=%s %d 0\r\n",
-			c.Email, escapeName(s.resolveFriendlyName(c.Email, c.FriendlyName)), c.GUID, listBits(c)))
-	}
-	for _, m := range msgs {
-		s.send(sess, m)
 	}
 }
 
@@ -850,6 +727,18 @@ func (s *Server) FriendlyName(email string) string {
 		return name
 	}
 	return s.resolveFriendlyName(email, "")
+}
+
+// ClientInfo はログイン中のユーザーのクライアントの世代を返す。オフラインならゼロ値。
+func (s *Server) ClientInfo(email string) core.ClientInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	sess := s.sessionForLocked(email)
+	if sess == nil {
+		return core.ClientInfo{}
+	}
+	id, _ := strconv.ParseUint(sess.capabilities, 10, 32)
+	return core.ClientInfo{Protocol: sess.proto, ClientID: uint32(id)}
 }
 
 func (s *Server) send(sess *clientSession, msg string) {

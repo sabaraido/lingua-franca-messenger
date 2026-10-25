@@ -1,18 +1,20 @@
 # Lingua Franca Messenger (LFM)
 
-An MSN Messenger protocol emulator server that supports multiple MSNP versions (MSNP8/9/10) through a common internal event representation.
+An MSN Messenger protocol emulator server that supports multiple MSNP versions (MSNP8–11) through a common internal event representation.
 
 > **Disclaimer**: This project is an unofficial fan-made server emulator and is not affiliated with, endorsed by, or connected to Microsoft Corporation in any way. MSN Messenger and related trademarks are the property of Microsoft Corporation.
 
 ## Features
 
 - ✅ MSNP8/9/10 support
+- 🧪 MSNP11 (MSN Messenger 7.0) support, including personal messages
 - ✅ Passport (TWN) authentication emulation
 - ✅ Multi-user simultaneous login
 - ✅ Real-time status change notifications
-- ✅ Text chat between users
+- ✅ Text chat between users, across protocol versions
+- ✅ Features newer clients send are translated for older ones (e.g. 7.0 nudges and winks appear as text in 5.0/6.2)
 - ✅ File transfer support
-- ✅ Contact list management (add/remove/block)
+- ✅ Contact list management (add/remove/block) and contact groups
 - ✅ Persistent user data
 
 ## Tested Clients
@@ -21,6 +23,7 @@ An MSN Messenger protocol emulator server that supports multiple MSNP versions (
 |--------|---------|--------|
 | MSN Messenger | 6.2.0205 | ✅ Working |
 | MSN Messenger | 5.0.0575 | ✅ Working |
+| MSN Messenger | 7.0 | 🔄 Not yet tested on a real client |
 
 ## Requirements
 

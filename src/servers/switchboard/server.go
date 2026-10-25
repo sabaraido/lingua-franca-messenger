@@ -26,6 +26,8 @@ type NSNotifier interface {
 	SendRNG(targetEmail, sbAddr, sessionID, sessionKey, callerEmail, callerFriendlyName string) bool
 	// FriendlyName はユーザーの現在の表示名を返す。
 	FriendlyName(email string) string
+	// ClientInfo はユーザーが使っているクライアントの世代を返す。
+	ClientInfo(email string) core.ClientInfo
 }
 
 // Server はSwitchboard(SB)サーバー。
@@ -129,18 +131,25 @@ func (s *Server) handleMSG(c *sbConn, parts []string, body []byte) {
 	trID := parts[1]
 	msgType := parts[2] // A, N, D, U
 
-	header := fmt.Sprintf("MSG %s %s %d\r\n", c.email, escapeName(c.friendlyName), len(body))
-	payload := append([]byte(header), body...)
 	for _, m := range sess.others(c) {
+		// 受信側のクライアントが扱えない形式(7.0のナッジなど)は、扱える形に変換する
+		adapted := body
+		if s.NS != nil {
+			adapted = core.AdaptMessage(body, s.NS.ClientInfo(m.email))
+		}
+		if adapted == nil {
+			continue
+		}
+		header := fmt.Sprintf("MSG %s %s %d\r\n", c.email, escapeName(c.friendlyName), len(adapted))
 		m.wmu.Lock()
-		_, err := m.conn.Write(payload)
+		_, err := m.conn.Write(append([]byte(header), adapted...))
 		m.wmu.Unlock()
 		if err != nil {
 			log.Printf("[SB] write error: %v", err)
 			continue
 		}
 		// 本文はログに残さない
-		log.Printf("[SB] >> %s: MSG %s (%d bytes)", m.conn.RemoteAddr(), c.email, len(body))
+		log.Printf("[SB] >> %s: MSG %s (%d bytes)", m.conn.RemoteAddr(), c.email, len(adapted))
 	}
 
 	// AとDタイプはACKが必要
