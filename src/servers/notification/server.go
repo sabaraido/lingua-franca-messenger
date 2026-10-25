@@ -21,14 +21,6 @@ import (
 // writeTimeout は1回の送信の上限。応答しないクライアントに引きずられないようにする。
 const writeTimeout = 10 * time.Second
 
-// supportedProtocols は対応しているMSNPバージョンと、その番号。
-var supportedProtocols = map[string]int{
-	"MSNP8":  8,
-	"MSNP9":  9,
-	"MSNP10": 10,
-	"MSNP11": 11,
-}
-
 type Server struct {
 	ListenAddr      string
 	SwitchboardAddr string
@@ -374,14 +366,9 @@ func (s *Server) handleLine(sess *clientSession, line string) {
 	switch cmd {
 	case "VER":
 		// クライアントの提示順(新しい順)に、対応している最初のバージョンを選ぶ
-		chosen, proto := "", 0
-		for _, v := range parts[2:] {
-			if n, ok := supportedProtocols[v]; ok {
-				chosen, proto = v, n
-				break
-			}
-		}
-		if chosen == "" {
+		chosen, proto, ok := core.NegotiateProtocol(parts[2:])
+		if !ok {
+			log.Printf("[NS] no supported version in client offer: %v", parts[2:])
 			sess.conn.Close()
 			return
 		}

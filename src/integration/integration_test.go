@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/sabaraido/lingua-franca-messenger/src/core"
+	"github.com/sabaraido/lingua-franca-messenger/src/servers/dispatch"
 	"github.com/sabaraido/lingua-franca-messenger/src/servers/notification"
 	"github.com/sabaraido/lingua-franca-messenger/src/servers/passport"
 	"github.com/sabaraido/lingua-franca-messenger/src/servers/switchboard"
@@ -28,6 +29,7 @@ const (
 type env struct {
 	t      *testing.T
 	store  *core.UserStore
+	dsAddr string
 	nsAddr string
 	sbAddr string
 	ppAddr string
@@ -69,17 +71,19 @@ func newEnv(t *testing.T) *env {
 	}
 	befriend(t, store, "alice@test.com", "bob@test.com")
 
-	e := &env{t: t, store: store, nsAddr: freeAddr(t), sbAddr: freeAddr(t), ppAddr: freeAddr(t)}
+	e := &env{t: t, store: store, dsAddr: freeAddr(t), nsAddr: freeAddr(t), sbAddr: freeAddr(t), ppAddr: freeAddr(t)}
 	tokens := core.NewTokenStore()
 	sb := switchboard.New(e.sbAddr, tokens)
 	sb.PublicAddr = e.sbAddr
 	ns := notification.New(e.nsAddr, e.sbAddr, store, tokens)
 	sb.NS = ns
 	ps := passport.New(e.ppAddr, store, tokens)
+	ds := dispatch.New(e.dsAddr, e.nsAddr)
 	go sb.ListenAndServe()
 	go ns.ListenAndServe()
 	go ps.ListenAndServe()
-	for _, a := range []string{e.nsAddr, e.sbAddr, e.ppAddr} {
+	go ds.ListenAndServe()
+	for _, a := range []string{e.dsAddr, e.nsAddr, e.sbAddr, e.ppAddr} {
 		waitListening(t, a)
 	}
 	return e
@@ -696,4 +700,62 @@ func TestMSNP11Login(t *testing.T) {
 	c.cmd("CHG NLN %s %%3Cmsnobj%%2F%%3E", clientID70)
 	// MSNP11 では clientid と MSNObject もそのまま返す
 	c.expect("CHG 6 NLN " + clientID70 + " %3Cmsnobj%2F%3E")
+}
+
+// clientVersions は対応しているクライアントが VER で提示するバージョンと、選ばれるべきバージョン。
+var clientVersions = []struct {
+	client, offer, want string
+}{
+	{"5.0", "MSNP8", "MSNP8"},
+	{"6.0", "MSNP9 MSNP8", "MSNP9"},
+	{"6.2", "MSNP10 MSNP9", "MSNP10"},
+	{"7.0", "MSNP11 MSNP10", "MSNP11"},
+	{"7.5", "MSNP12 MSNP11 MSNP10", "MSNP11"},
+}
+
+func TestDispatchAcceptsAllSupportedClients(t *testing.T) {
+	e := newEnv(t)
+	for _, v := range clientVersions {
+		c := dial(t, v.client+"/ds", e.dsAddr)
+		c.cmd("VER %s CVR0", v.offer)
+		c.expect("VER 1 " + v.want + " CVR0")
+		c.cmd("CVR 0x0411 winnt 5.1 i386 MSNMSGR %s MSMSGS alice@test.com", v.client)
+		c.expect("CVR 2 " + v.client)
+		c.cmd("USR TWN I alice@test.com")
+		c.expect("XFR 3 NS " + e.nsAddr)
+	}
+}
+
+func TestAllSupportedClientsCanSignIn(t *testing.T) {
+	e := newEnv(t)
+	for _, v := range clientVersions {
+		c := e.connect("alice@test.com", v.offer)
+		c.cmd("USR TWN S %s", e.ticket("alice@test.com"))
+		c.expect("USR 4 OK alice@test.com")
+		c.cmd("SYN 0 0")
+		c.expect("SYN 5 ")
+		c.expect("LST ")
+		c.conn.Close()
+	}
+}
+
+func TestMSNP9ReceivesDisplayPicture(t *testing.T) {
+	e := newEnv(t)
+	// 6.0/6.1相当(MSNP9)はリストはMSNP8形式、在席通知にはMSNObjectが付く
+	alice := e.connect("alice@test.com", "MSNP9 MSNP8")
+	alice.cmd("USR TWN S %s", e.ticket("alice@test.com"))
+	alice.expect("USR 4 OK alice@test.com Alice%20A 1 0")
+	alice.cmd("SYN 0")
+	alice.expect("LST bob@test.com Bob 11 0")
+	alice.cmd("CHG NLN 268435456")
+	alice.expect("CHG")
+
+	bob := e.connect("bob@test.com", "MSNP10")
+	bob.cmd("USR TWN S %s", e.ticket("bob@test.com"))
+	bob.expect("USR")
+	bob.cmd("CHG NLN 805306404 %%3Cmsnobj%%2F%%3E")
+	alice.expect("NLN NLN bob@test.com Bob 805306404 %3Cmsnobj%2F%3E")
+
+	alice.cmd("PNG")
+	alice.expect("QNG 60")
 }

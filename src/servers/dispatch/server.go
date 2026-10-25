@@ -6,6 +6,8 @@ import (
 	"log"
 	"net"
 	"strings"
+
+	"github.com/sabaraido/lingua-franca-messenger/src/core"
 )
 
 // Server はDispatch Server(DS)を表す。
@@ -90,19 +92,8 @@ func (s *Server) handleLine(conn net.Conn, line string) {
 		// サーバー側が対応するものを選んで返す。
 		// 対応してないバージョンを勝手に押し付けるとクライアントが切断する
 		// (0x81000305などのエラーになる)ので要注意。
-		supported := map[string]bool{
-			"MSNP8":  true,
-			"MSNP9":  true,
-			"MSNP10": true,
-		}
-		chosen := ""
-		for _, v := range parts[2:] {
-			if supported[v] {
-				chosen = v
-				break
-			}
-		}
-		if chosen == "" {
+		chosen, _, ok := core.NegotiateProtocol(parts[2:])
+		if !ok {
 			log.Printf("[DS] no supported version in client offer: %v", parts[2:])
 			conn.Close()
 			return

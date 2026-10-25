@@ -6,8 +6,8 @@ An MSN Messenger protocol emulator server that supports multiple MSNP versions (
 
 ## Features
 
-- ✅ MSNP8/9/10 support
-- 🧪 MSNP11 (MSN Messenger 7.0) support, including personal messages
+- ✅ Supports MSN Messenger 5.0 through 7.5 (MSNP8–11; 7.5 connects using MSNP11)
+- ✅ Personal messages for 7.0 / 7.5
 - ✅ Passport (TWN) authentication emulation
 - ✅ Multi-user simultaneous login
 - ✅ Real-time status change notifications
@@ -17,13 +17,17 @@ An MSN Messenger protocol emulator server that supports multiple MSNP versions (
 - ✅ Contact list management (add/remove/block) and contact groups
 - ✅ Persistent user data
 
-## Tested Clients
+## Supported Clients
 
-| Client | Version | Status |
-|--------|---------|--------|
-| MSN Messenger | 6.2.0205 | ✅ Working |
-| MSN Messenger | 5.0.0575 | ✅ Working |
-| MSN Messenger | 7.0 | 🔄 Not yet tested on a real client |
+| Client | Protocol | Status |
+|--------|----------|--------|
+| MSN Messenger 5.0 (5.0.0575) | MSNP8 | ✅ Tested |
+| MSN Messenger 6.0 / 6.1 | MSNP9 | 🔄 Not yet tested on a real client |
+| MSN Messenger 6.2 (6.2.0205) | MSNP10 | ✅ Tested |
+| MSN Messenger 7.0 | MSNP11 | 🔄 Not yet tested on a real client |
+| MSN Messenger 7.5 | MSNP11 | 🔄 Not yet tested on a real client |
+
+Windows Live Messenger 8.0 and later (MSNP13+) use SOAP-based contact lists and are not supported. MSN Messenger 4.x and earlier (MSNP7 and below) are planned for later.
 
 ## Requirements
 

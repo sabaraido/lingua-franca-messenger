@@ -20,6 +20,10 @@ func TestClientInfoHasNudge(t *testing.T) {
 	if !client70.Has(CapNudge) {
 		t.Fatal("7.0 supports nudges")
 	}
+	// 7.5 は MSNP11 で接続し、clientid は MSNC5
+	if !(ClientInfo{Protocol: 11, ClientID: 0x50000000}).Has(CapNudge) {
+		t.Fatal("7.5 supports nudges")
+	}
 	// MSNP10で接続していても clientid が MSNC4 なら対応している
 	if !(ClientInfo{Protocol: 10, ClientID: 0x40000000}).Has(CapNudge) {
 		t.Fatal("MSNC4 client should support nudges")
