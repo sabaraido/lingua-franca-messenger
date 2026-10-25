@@ -5,6 +5,16 @@ logs/
 # 環境設定
 .env
 
+# 証明書・秘密鍵(環境ごとに scripts/gen-certs.sh で生成する)
+ca/
+certs/
+/ca-cert.cer
+*.pem
+*.key
+
+# アーカイブ(秘密鍵や.envを含みうる)
+*.zip
+
 # Go
 /bin/
 /lfm
