@@ -31,7 +31,7 @@ func TestInZones(t *testing.T) {
 		"config.messenger.msn.com":      false,
 	}
 	for name, want := range cases {
-		if got := inZones(name); got != want {
+		if got := inZones(DefaultZones, name); got != want {
 			t.Errorf("inZones(%q) = %v, want %v", name, got, want)
 		}
 	}

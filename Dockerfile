@@ -11,5 +11,5 @@ COPY --from=builder /lfm /app/lfm
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 COPY stunnel.conf /app/stunnel.conf
 RUN chmod +x /app/docker-entrypoint.sh
-EXPOSE 1863 1864 1865 443 53/udp
+EXPOSE 1863 1864 1865 443 80 53/udp
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
