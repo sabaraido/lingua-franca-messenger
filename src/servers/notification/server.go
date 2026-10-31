@@ -49,7 +49,7 @@ type clientSession struct {
 
 	msnpVersion  string // VERで決めたバージョン("MSNP8" など)
 	proto        int    // msnpVersion の番号部分(8, 9, 10, 11)
-	pendingEmail string // USR TWN I で名乗ったアドレス(未認証)
+	pendingEmail string // USR TWN I / USR MD5 I で名乗ったアドレス(未認証)
 	userEmail    string // 認証済みのアドレス。チケット照合に成功するまで空
 	friendlyName string
 	status       string
@@ -119,13 +119,17 @@ func escapeName(name string) string {
 
 // presenceArgs はILN/NLNに続く "status email name clientid [msnobj]" を
 // 受信側クライアントのバージョンに合わせて組み立てる。呼び出し側で mu を保持すること。
-// MSNObjectはMSNP9以降なので、MSNP8クライアントには付けない。
+// clientidはMSNP8以降、MSNObjectはMSNP9以降なので、それより古いクライアントには付けない。
 func presenceArgs(target, receiver *clientSession) string {
+	args := fmt.Sprintf("%s %s %s", target.status, target.userEmail, escapeName(target.friendlyName))
+	if receiver.proto < 8 {
+		return args
+	}
 	caps := target.capabilities
 	if caps == "" {
 		caps = "0"
 	}
-	args := fmt.Sprintf("%s %s %s %s", target.status, target.userEmail, escapeName(target.friendlyName), caps)
+	args += " " + caps
 	if target.msnobj != "" && receiver.supportsMSNObject() {
 		args += " " + target.msnobj
 	}
@@ -359,7 +363,7 @@ func (s *Server) handleLine(sess *clientSession, line string) {
 	// 認証前に受け付けるのはログイン手順のコマンドだけ
 	if sess.userEmail == "" {
 		switch cmd {
-		case "VER", "CVR", "USR", "PNG", "OUT":
+		case "VER", "INF", "CVR", "USR", "PNG", "OUT":
 		default:
 			log.Printf("[NS] %s before authentication, closing", cmd)
 			sess.conn.Close()
@@ -379,17 +383,15 @@ func (s *Server) handleLine(sess *clientSession, line string) {
 		s.update(func() { sess.msnpVersion, sess.proto = chosen, proto })
 		s.send(sess, fmt.Sprintf("VER %s %s CVR0\r\n", trID, chosen))
 
+	case "INF":
+		// MSNP7以前: 使える認証方式を問い合わせてくる
+		s.send(sess, fmt.Sprintf("INF %s MD5\r\n", trID))
+
 	case "CVR":
-		// クライアントのバージョンに合わせたCVRレスポンスを返す
-		clientVersion := "6.2.0205"
-		for i, p := range parts {
-			if p == "MSNMSGR" && i+1 < len(parts) {
-				clientVersion = parts[i+1]
-				break
-			}
-		}
+		// クライアント自身のバージョンを推奨・最小バージョンとして返す(更新を促さない)
+		v := core.CVRClientVersion(parts)
 		s.send(sess, fmt.Sprintf("CVR %s %s %s %s http://messenger.msn.com/ http://messenger.msn.com/\r\n",
-			trID, clientVersion, clientVersion, clientVersion))
+			trID, v, v, v))
 
 	case "USR":
 		s.handleUSR(sess, parts, trID)
@@ -399,9 +401,12 @@ func (s *Server) handleLine(sess *clientSession, line string) {
 		if len(parts) >= 3 {
 			clientVer, _ = strconv.ParseInt(parts[2], 10, 64)
 		}
-		if sess.usesListVersions() {
+		switch {
+		case sess.proto < 8:
+			s.syncMSNP7(sess, trID, clientVer)
+		case sess.usesListVersions():
 			s.syncMSNP8(sess, trID, clientVer)
-		} else {
+		default:
 			s.syncMSNP10(sess, trID)
 		}
 
@@ -548,45 +553,70 @@ func (s *Server) handleUSR(sess *clientSession, parts []string, trID string) {
 			sess.conn.Close()
 			return
 		}
-		user, ok := s.Users.Get(sess.pendingEmail)
-		if !ok {
+		s.completeLogin(sess, trID)
+
+	case len(parts) >= 5 && parts[2] == "MD5" && parts[3] == "I" && sess.proto < 8:
+		// MSNP7以前: saltを渡し、md5(salt+password)を返してもらう
+		pending := parts[4]
+		s.update(func() { sess.pendingEmail = pending })
+		s.send(sess, fmt.Sprintf("USR %s MD5 S %s\r\n", trID, s.Users.MD5Salt(pending)))
+
+	case len(parts) >= 5 && parts[2] == "MD5" && parts[3] == "S" && sess.pendingEmail != "":
+		if !s.Users.AuthenticateMD5(sess.pendingEmail, strings.ToLower(parts[4])) {
+			log.Printf("[NS] USR: MD5 authentication failed for %s", sess.pendingEmail)
 			s.send(sess, fmt.Sprintf("911 %s\r\n", trID))
 			sess.conn.Close()
 			return
 		}
-
-		// 同じアカウントの既存セッションは OUT OTH で切断する
-		var old []*clientSession
-		s.update(func() {
-			for other := range s.sessions {
-				if other != sess && !other.superseded && strings.EqualFold(other.userEmail, sess.pendingEmail) {
-					other.superseded = true
-					old = append(old, other)
-				}
-			}
-			sess.userEmail = sess.pendingEmail
-			sess.friendlyName = user.FriendlyName
-		})
-		for _, other := range old {
-			log.Printf("[NS] %s signed in from another location, disconnecting old session", sess.userEmail)
-			s.send(other, "OUT OTH\r\n")
-			other.conn.Close()
-		}
-
-		if sess.proto >= 10 {
-			s.send(sess, fmt.Sprintf("USR %s OK %s 1 0\r\n", trID, sess.userEmail))
-		} else {
-			// MSNP8/9: USR trID OK email friendlyname verified 0
-			s.send(sess, fmt.Sprintf("USR %s OK %s %s 1 0\r\n",
-				trID, sess.userEmail, escapeName(sess.friendlyName)))
-		}
-		s.sendProfile(sess)
+		s.completeLogin(sess, trID)
 
 	default:
-		// MD5認証などは未対応
+		// それ以外の認証方式は未対応
 		s.send(sess, fmt.Sprintf("911 %s\r\n", trID))
 		sess.conn.Close()
 	}
+}
+
+// completeLogin は認証に成功した pendingEmail でログインさせ、USR OK とプロフィールを送る。
+func (s *Server) completeLogin(sess *clientSession, trID string) {
+	user, ok := s.Users.Get(sess.pendingEmail)
+	if !ok {
+		s.send(sess, fmt.Sprintf("911 %s\r\n", trID))
+		sess.conn.Close()
+		return
+	}
+
+	// 同じアカウントの既存セッションは OUT OTH で切断する
+	var old []*clientSession
+	s.update(func() {
+		for other := range s.sessions {
+			if other != sess && !other.superseded && strings.EqualFold(other.userEmail, sess.pendingEmail) {
+				other.superseded = true
+				old = append(old, other)
+			}
+		}
+		sess.userEmail = sess.pendingEmail
+		sess.friendlyName = user.FriendlyName
+	})
+	for _, other := range old {
+		log.Printf("[NS] %s signed in from another location, disconnecting old session", sess.userEmail)
+		s.send(other, "OUT OTH\r\n")
+		other.conn.Close()
+	}
+
+	switch {
+	case sess.proto >= 10:
+		s.send(sess, fmt.Sprintf("USR %s OK %s 1 0\r\n", trID, sess.userEmail))
+	case sess.proto >= 8:
+		// MSNP8/9: USR trID OK email friendlyname verified 0
+		s.send(sess, fmt.Sprintf("USR %s OK %s %s 1 0\r\n",
+			trID, sess.userEmail, escapeName(sess.friendlyName)))
+	default:
+		// MSNP7以前: USR trID OK email friendlyname
+		s.send(sess, fmt.Sprintf("USR %s OK %s %s\r\n",
+			trID, sess.userEmail, escapeName(sess.friendlyName)))
+	}
+	s.sendProfile(sess)
 }
 
 func (s *Server) handleCHG(sess *clientSession, parts []string, trID string) {

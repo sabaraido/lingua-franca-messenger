@@ -57,6 +57,7 @@ func (s *Server) handleConn(conn net.Conn) {
 	log.Printf("[DS] new connection from %s", remote)
 
 	reader := bufio.NewReader(conn)
+	proto := 0 // VERで決めたバージョンの番号
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -69,13 +70,13 @@ func (s *Server) handleConn(conn net.Conn) {
 		}
 		log.Printf("[DS] << %s: %s", remote, line)
 
-		s.handleLine(conn, line)
+		s.handleLine(conn, line, &proto)
 	}
 }
 
 // handleLine は1行分のMSNPコマンドを処理する。
 // 現状はVERとCVRを認識し、その他はログのみ。
-func (s *Server) handleLine(conn net.Conn, line string) {
+func (s *Server) handleLine(conn net.Conn, line string, proto *int) {
 	parts := strings.Fields(line)
 	if len(parts) == 0 {
 		return
@@ -94,24 +95,22 @@ func (s *Server) handleLine(conn net.Conn, line string) {
 		// サーバー側が対応するものを選んで返す。
 		// 対応してないバージョンを勝手に押し付けるとクライアントが切断する
 		// (0x81000305などのエラーになる)ので要注意。
-		chosen, _, ok := core.NegotiateProtocol(parts[2:])
+		chosen, n, ok := core.NegotiateProtocol(parts[2:])
 		if !ok {
 			log.Printf("[DS] no supported version in client offer: %v", parts[2:])
 			conn.Close()
 			return
 		}
+		*proto = n
 		resp := fmt.Sprintf("VER %s %s CVR0\r\n", trID, chosen)
 		s.write(conn, resp)
+	case "INF":
+		// MSNP7以前: 使える認証方式を問い合わせてくる
+		s.write(conn, fmt.Sprintf("INF %s MD5\r\n", trID))
 	case "CVR":
 		// 例: CVR 2 0x0409 winnt 5.1 i386 MSNMSGR 6.2.0137 MSMSGS user@example.com
 		// NSと同様に、クライアント自身のバージョンを推奨・最小バージョンとして返す
-		clientVersion := "6.2.0205"
-		for i, p := range parts {
-			if p == "MSNMSGR" && i+1 < len(parts) {
-				clientVersion = parts[i+1]
-				break
-			}
-		}
+		clientVersion := core.CVRClientVersion(parts)
 		resp := fmt.Sprintf("CVR %s %s %s %s http://messenger.msn.com/ http://messenger.msn.com/\r\n",
 			trID, clientVersion, clientVersion, clientVersion)
 		s.write(conn, resp)
@@ -119,8 +118,12 @@ func (s *Server) handleLine(conn net.Conn, line string) {
 	case "USR":
 		// XFR応答でNSへ誘導する: XFR trID NS 移動先 0 今のサーバー
 		// 例: XFR 3 NS 192.168.1.10:1864 0 192.168.1.10:1863
-		// 5.0/6.2 は最後のアドレスがなくても動くが、7.0 は無いと移動せずに止まる
+		// 5.0/6.2 は最後のアドレスがなくても動くが、7.0 は無いと移動せずに止まる。
+		// MSNP7以前はこのアドレスがない形(XFR trID NS 移動先 0)だったので付けない。
 		resp := fmt.Sprintf("XFR %s NS %s 0 %s\r\n", trID, s.NotificationServerAddr, s.PublicAddr)
+		if *proto < 8 {
+			resp = fmt.Sprintf("XFR %s NS %s 0\r\n", trID, s.NotificationServerAddr)
+		}
 		s.write(conn, resp)
 
 	default:

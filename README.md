@@ -1,12 +1,12 @@
 # Lingua Franca Messenger (LFM)
 
-An MSN Messenger protocol emulator server that supports multiple MSNP versions (MSNP8–11) through a common internal event representation.
+An MSN Messenger protocol emulator server that supports multiple MSNP versions (MSNP7–11) through a common internal event representation.
 
 > **Disclaimer**: This project is an unofficial fan-made server emulator and is not affiliated with, endorsed by, or connected to Microsoft Corporation in any way. MSN Messenger and related trademarks are the property of Microsoft Corporation.
 
 ## Features
 
-- ✅ Supports MSN Messenger 5.0 through 7.5 (MSNP8–11; 7.5 connects using MSNP11)
+- ✅ Supports MSN Messenger 3.6 through 7.5 and Windows Messenger 4.5 (MSNP7–11; 7.5 connects using MSNP11)
 - ✅ Personal messages for 7.0 / 7.5
 - ✅ Passport (TWN) authentication emulation
 - ✅ Multi-user simultaneous login
@@ -21,13 +21,18 @@ An MSN Messenger protocol emulator server that supports multiple MSNP versions (
 
 | Client | Protocol | Status |
 |--------|----------|--------|
+| MSN Messenger 3.6 | MSNP7 | ✅ Tested (MD5 sign-in) |
+| MSN Messenger 4.6 | MSNP7 | ✅ Tested (MD5 sign-in) |
+| Windows Messenger 4.5 (4.5.0127) | MSNP7 | ✅ Tested (MD5 sign-in) |
 | MSN Messenger 5.0 (5.0.0575) | MSNP8 | ✅ Tested |
 | MSN Messenger 6.0 / 6.1 | MSNP9 | 🔄 Not yet tested on a real client |
 | MSN Messenger 6.2 (6.2.0205) | MSNP10 | ✅ Tested |
 | MSN Messenger 7.0 (7.0.0820) | MSNP11 | ✅ Tested |
 | MSN Messenger 7.5 (7.5.0324) | MSNP11 | ✅ Tested (sign-in via RST.srf) |
 
-Windows Live Messenger 8.0 and later (MSNP13+) use SOAP-based contact lists and are not supported. MSN Messenger 4.x and earlier (MSNP7 and below) are planned for later.
+Windows Live Messenger 8.0 and later (MSNP13+) use SOAP-based contact lists and are not supported yet.
+
+MSNP7 clients sign in with MD5 challenge-response instead of Passport. For this, LFM also stores \`md5(salt + password)\` per user, created by \`-adduser\` or by the user's next successful sign-in from 5.0 or later. Anyone who obtains this value can sign in with an MSNP7 client. Set \`LFM_LEGACY_MD5=off\` to refuse MD5 sign-in and drop the stored values.
 
 ## Requirements
 

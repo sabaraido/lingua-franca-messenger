@@ -51,6 +51,9 @@ type User struct {
 	Email        string `json:"email"`
 	PasswordHash string `json:"password_hash"`
 	FriendlyName string `json:"friendly_name"`
+	// MD5Salt / MD5Hash はMSNP7以前のMD5認証用(legacyauth.go)。
+	MD5Salt string `json:"md5_salt,omitempty"`
+	MD5Hash string `json:"md5_hash,omitempty"`
 	// Privacy はBLPの設定。"AL"(BL以外は許可, 既定) か "BL"(AL以外は拒否)。
 	Privacy  string     `json:"privacy,omitempty"`
 	Groups   []*Group   `json:"groups,omitempty"`
@@ -62,6 +65,9 @@ type User struct {
 // 別プロセス(lfm -adduser)によるファイル更新は、次の参照・更新時に
 // 更新日時の変化から検知して読み込み直す。保存は一時ファイル経由で置き換える。
 type UserStore struct {
+	// LegacyMD5 は、MSNP7以前のMD5認証のための値を保存し、MD5認証を受け付けるか。
+	LegacyMD5 bool
+
 	mu      sync.RWMutex
 	path    string
 	users   map[string]*User
@@ -210,16 +216,19 @@ func (s *UserStore) AddUser(email, password, friendlyName string) error {
 	defer s.mu.Unlock()
 	s.refreshLocked()
 	key := normalizeEmail(email)
-	if existing, ok := s.users[key]; ok {
-		existing.PasswordHash = hash
-		existing.FriendlyName = friendlyName
+	u, ok := s.users[key]
+	if ok {
+		u.PasswordHash = hash
+		u.FriendlyName = friendlyName
 	} else {
-		s.users[key] = &User{
+		u = &User{
 			Email:        email,
 			PasswordHash: hash,
 			FriendlyName: friendlyName,
 		}
+		s.users[key] = u
 	}
+	s.setLegacyMD5Locked(u, password)
 	return s.save()
 }
 
@@ -253,6 +262,9 @@ func (s *UserStore) Authenticate(email, password string) bool {
 			}
 			s.mu.Unlock()
 		}
+	}
+	if valid {
+		s.rememberLegacyMD5(email, password)
 	}
 	return valid
 }

@@ -36,6 +36,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("userstore init failed: %v", err)
 	}
+	// 3.x・4.x・Windows Messenger 4.x(MSNP7以前)のMD5認証。LFM_LEGACY_MD5=off で無効化
+	store.LegacyMD5 = getEnv("LFM_LEGACY_MD5", "on") != "off"
 
 	if *addUser != "" {
 		email, password, friendlyName, perr := parseAddUser(*addUser)

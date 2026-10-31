@@ -4,6 +4,8 @@ package integration
 
 import (
 	"bufio"
+	"crypto/md5"
+	"encoding/hex"
 	"fmt"
 	"html"
 	"io"
@@ -66,6 +68,7 @@ func newEnv(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.LegacyMD5 = true
 	for _, u := range [][2]string{{"alice@test.com", "Alice A"}, {"bob@test.com", "Bob"}, {"carol@test.com", "Carol"}} {
 		if err := store.AddUser(u[0], "pw", u[1]); err != nil {
 			t.Fatal(err)
@@ -126,7 +129,12 @@ func (c *client) cmd(format string, args ...any) string {
 	c.tr++
 	id := strconv.Itoa(c.tr)
 	line := fmt.Sprintf(format, args...)
-	c.raw(strings.Replace(line, " ", " "+id+" ", 1) + "\r\n")
+	if strings.Contains(line, " ") {
+		line = strings.Replace(line, " ", " "+id+" ", 1)
+	} else {
+		line += " " + id // 引数のないコマンド(INFなど)
+	}
+	c.raw(line + "\r\n")
 	return id
 }
 
@@ -853,5 +861,121 @@ func TestRSTEscapedCredentials(t *testing.T) {
 	_, body := e.rst("amp@test.com", "a&amp;b&lt;c", "?id=507")
 	if !reMessengerToken.MatchString(body) {
 		t.Fatalf("escaped password should be accepted: %s", body)
+	}
+}
+
+// loginMD5 はMSNP7(3.x・4.x・Windows Messenger 4.x)の手順でログインする。
+func (e *env) loginMD5(email, password string) *client {
+	c := dial(e.t, email+"/MSNP7", e.nsAddr)
+	c.cmd("VER MSNP7 MSNP6 MSNP5 MSNP4 CVR0")
+	c.expect("VER 1 MSNP7")
+	c.cmd("INF")
+	c.expect("INF 2 MD5")
+	c.cmd("USR MD5 I %s", email)
+	salt := strings.Fields(c.expect("USR 3 MD5 S"))[4]
+	sum := md5.Sum([]byte(salt + password))
+	c.cmd("USR MD5 S %s", hex.EncodeToString(sum[:]))
+	return c
+}
+
+func TestDispatchMSNP7(t *testing.T) {
+	e := newEnv(t)
+	c := dial(t, "wm/ds", e.dsAddr)
+	c.cmd("VER MSNP7 MSNP6 MSNP5 MSNP4 CVR0")
+	c.expect("VER 1 MSNP7 CVR0")
+	c.cmd("INF")
+	c.expect("INF 2 MD5")
+	c.cmd("USR MD5 I alice@test.com")
+	// MSNP7以前のXFRには、最後のDSのアドレスを付けない
+	if line := c.expect("XFR 3 NS"); line != "XFR 3 NS "+e.nsAddr+" 0" {
+		t.Fatalf("XFR = %q", line)
+	}
+}
+
+func TestCVRDoesNotForceUpgrade(t *testing.T) {
+	e := newEnv(t)
+	c := dial(t, "wm/ds", e.dsAddr)
+	c.cmd("VER MSNP7 CVR0")
+	c.expect("VER")
+	c.cmd("CVR 0x0411 winnt 5.1 i386 MSMSGS 4.7.3001 MSMSGS alice@test.com")
+	c.expect("CVR 2 4.7.3001 4.7.3001 4.7.3001 ")
+}
+
+func TestLoginMSNP7(t *testing.T) {
+	e := newEnv(t)
+	c := e.loginMD5("alice@test.com", "pw")
+	c.expect("USR 4 OK alice@test.com Alice%20A")
+	c.cmd("SYN 0")
+	lines := c.linesUntilQuiet()
+	want := []string{
+		"SYN 5 ",
+		"GTC 5 ",
+		"BLP 5 ",
+		"LSG 5 ",
+		"LST 5 FL ",
+		"LST 5 AL ",
+		"LST 5 BL ",
+		"LST 5 RL ",
+	}
+	var got []string
+	for _, l := range lines {
+		if !strings.HasPrefix(l, "MSG") {
+			got = append(got, l)
+		}
+	}
+	for i, prefix := range want {
+		if i >= len(got) || !strings.HasPrefix(got[i], prefix) {
+			t.Fatalf("SYN response line %d: want %q, got %q", i, prefix, got)
+		}
+	}
+	ver := strings.Fields(got[0])[2]
+	for _, l := range []string{
+		"LSG 5 " + ver + " 1 1 0 Other%20Contacts 0",
+		"LST 5 FL " + ver + " 1 1 bob@test.com Bob 0",
+		"LST 5 AL " + ver + " 1 1 bob@test.com Bob",
+		"LST 5 BL " + ver + " 0 0",
+		"LST 5 RL " + ver + " 1 1 bob@test.com Bob",
+	} {
+		found := false
+		for _, g := range got {
+			found = found || g == l
+		}
+		if !found {
+			t.Errorf("missing %q in %q", l, got)
+		}
+	}
+}
+
+func TestMSNP7WrongPassword(t *testing.T) {
+	e := newEnv(t)
+	c := e.loginMD5("alice@test.com", "wrong")
+	c.expect("911 4")
+	c.expectClosed()
+
+	// 存在しないユーザーも同じ流れで断る
+	c = e.loginMD5("nobody@test.com", "pw")
+	c.expect("911 4")
+	c.expectClosed()
+}
+
+func TestPresenceBetweenMSNP7AndMSNP8(t *testing.T) {
+	e := newEnv(t)
+	old := e.loginMD5("alice@test.com", "pw")
+	old.expect("USR 4 OK")
+	old.cmd("SYN 0")
+	old.expect("SYN")
+	old.cmd("CHG NLN")
+	old.expect("CHG 6 NLN")
+
+	bob := e.login("bob@test.com", "MSNP8")
+	// MSNP7のクライアントには clientid を付けない
+	if line := old.expect("NLN NLN bob@test.com"); line != "NLN NLN bob@test.com Bob" {
+		t.Fatalf("NLN to MSNP7 = %q", line)
+	}
+	bob.expect("ILN")
+
+	bob.cmd("CHG AWY 0")
+	if line := old.expect("NLN AWY bob@test.com"); line != "NLN AWY bob@test.com Bob" {
+		t.Fatalf("NLN to MSNP7 = %q", line)
 	}
 }

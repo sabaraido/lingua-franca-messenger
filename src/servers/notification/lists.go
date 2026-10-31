@@ -150,6 +150,54 @@ func (s *Server) syncMSNP8(sess *clientSession, trID string, clientVer int64) {
 	}
 }
 
+// syncMSNP7 はMSNP7以前の形式でコンタクトリストを送る。どの行にも trID とバージョンが付き、
+// グループとリストは1件ずつ「何件目/全何件」で送る。空のリストは "0 0"。
+//
+//	SYN trID version
+//	GTC trID version A / BLP trID version AL
+//	LSG trID version index total id name 0
+//	LST trID FL version index total email name groupIDs
+//	LST trID AL|BL|RL version index total email name
+func (s *Server) syncMSNP7(sess *clientSession, trID string, clientVer int64) {
+	contacts := s.Users.GetContacts(sess.userEmail)
+	groups := s.Users.Groups(sess.userEmail)
+	byGUID := groupsByGUID(groups)
+	ver := s.syncListVersion(clientVer)
+
+	msgs := []string{
+		fmt.Sprintf("SYN %s %d\r\n", trID, ver),
+		fmt.Sprintf("GTC %s %d A\r\n", trID, ver),
+		fmt.Sprintf("BLP %s %d %s\r\n", trID, ver, s.Users.Privacy(sess.userEmail)),
+		fmt.Sprintf("LSG %s %d 1 %d 0 Other%%20Contacts 0\r\n", trID, ver, len(groups)+1),
+	}
+	for i, g := range groups {
+		msgs = append(msgs, fmt.Sprintf("LSG %s %d %d %d %d %s 0\r\n", trID, ver, i+2, len(groups)+1, g.ID, escapeName(g.Name)))
+	}
+	for _, list := range []string{"FL", "AL", "BL", "RL"} {
+		var members []core.Contact
+		for _, c := range contacts {
+			if c.HasList(list) {
+				members = append(members, c)
+			}
+		}
+		if len(members) == 0 {
+			msgs = append(msgs, fmt.Sprintf("LST %s %s %d 0 0\r\n", trID, list, ver))
+			continue
+		}
+		for i, c := range members {
+			line := fmt.Sprintf("LST %s %s %d %d %d %s %s", trID, list, ver, i+1, len(members),
+				c.Email, escapeName(s.resolveFriendlyName(c.Email, c.FriendlyName)))
+			if list == "FL" {
+				line += " " + groupIDsMSNP8(c, byGUID)
+			}
+			msgs = append(msgs, line+"\r\n")
+		}
+	}
+	for _, m := range msgs {
+		s.send(sess, m)
+	}
+}
+
 // syncMSNP10 はMSNP10以降の形式でコンタクトリストを送る。
 //
 //	SYN trID timestamp timestamp lstCount lsgCount
