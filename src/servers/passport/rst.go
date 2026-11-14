@@ -14,14 +14,22 @@ import (
 	"github.com/sabaraido/lingua-franca-messenger/src/core"
 )
 
-// RST.srf は MSN Messenger 7.5 が使うSOAP形式のPassport認証(WS-Trust の RequestSecurityToken)。
+// RST.srf は MSN Messenger 7.5 と Windows Live Messenger が使うSOAP形式のPassport認証
+// (WS-Trust の RequestSecurityToken)。
 //
 // クライアントは UsernameToken(メールアドレス・パスワード)と、トークンが欲しいサービスの
-// 一覧(wsa:Address)を送ってくる。messenger.msn.com 向けのトークンが、NSの USR TWN S で
-// 使うチケット(t=...&p=...)になる。
+// 一覧(wsa:Address)を送ってくる。
+//   - messenger.msn.com(7.5): NSの USR TWN S で使うチケット(t=...&p=...)。使い捨て
+//   - messengerclear.live.com(Windows Live Messenger): NSの USR SSO S で使うチケット
+//   - contacts.msn.com: アドレス帳(ABCH)のSOAP呼び出しに付けるチケット
+//
+// Windows Live Messenger はチケットを期限まで保存して使い回すので、後の2つは署名付き(SignedTickets)。
+//
+// messengerclear.live.com には鍵(ProofToken)も付ける。Windows Live Messenger は
+// NSが USR SSO S で渡すチャレンジをこの鍵で暗号化して返してくる(LFMは照合しない)。
 
-// messengerAddress はNSのチケットを返すサービス名。
-const messengerAddress = "messenger.msn.com"
+// SignedTicketTTL は署名付きチケットの有効期間。応答の Lifetime と合わせる。
+const SignedTicketTTL = 24 * time.Hour
 
 var (
 	reUsername = regexp.MustCompile(`(?s)<(?:\w+:)?Username(?:\s[^>]*)?>(.*?)</(?:\w+:)?Username>`)
@@ -37,7 +45,8 @@ func xmlText(re *regexp.Regexp, body string) string {
 	return ""
 }
 
-func (s *Server) handleRST(conn net.Conn, body []byte) {
+// rst2 なら RST2.srf(Windows Live Messenger)の形で応答する(rst2.go)。
+func (s *Server) handleRST(conn net.Conn, body []byte, rst2 bool) {
 	req := string(body)
 	email := xmlText(reUsername, req)
 	password := xmlText(rePassword, req)
@@ -63,21 +72,35 @@ func (s *Server) handleRST(conn net.Conn, body []byte) {
 	s.Tokens.Put(ticket, email, core.ScopePassport, PassportTicketTTL)
 
 	now := time.Now().UTC()
+	passportTB, compact := rstPassportTB, rstCompactToken
+	if rst2 {
+		passportTB = func(_ int, now time.Time) string { return rst2PassportTB(now) }
+		compact = rst2CompactToken
+	}
 	var responses strings.Builder
 	for i, addr := range addresses {
-		if strings.EqualFold(addr, "http://Passport.NET/tb") {
-			responses.WriteString(rstPassportTB(i, now))
-			continue
+		lower := strings.ToLower(addr)
+		switch {
+		case lower == "http://passport.net/tb":
+			responses.WriteString(passportTB(i, now))
+		case lower == "messenger.msn.com":
+			responses.WriteString(compact(i, addr, ticket, false, now))
+		case lower == "messengerclear.live.com":
+			responses.WriteString(compact(i, addr, s.Tickets.Issue(email, core.TicketNS, SignedTicketTTL), true, now))
+		case lower == "contacts.msn.com":
+			responses.WriteString(compact(i, addr, s.Tickets.Issue(email, core.TicketABCH, SignedTicketTTL), false, now))
+		default:
+			// それ以外のサービスにも形式上のトークンを返す(使われない)
+			responses.WriteString(compact(i, addr, "t="+randomHex(32)+"&p="+randomHex(32), false, now))
 		}
-		// messenger.msn.com 以外のサービスにも形式上のトークンを返す(使われない)
-		token := ticket
-		if !strings.EqualFold(addr, messengerAddress) {
-			token = "t=" + randomHex(32) + "&p=" + randomHex(32)
-		}
-		responses.WriteString(rstCompactToken(i, addr, token, now))
 	}
 	log.Printf("[Passport] RST success for %s", email)
-	writeSOAP(conn, rstEnvelope(responses.String(), now))
+	if rst2 {
+		host, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+		writeSOAP(conn, rst2Envelope(email, host, responses.String(), now))
+	} else {
+		writeSOAP(conn, rstEnvelope(responses.String(), now))
+	}
 }
 
 func writeSOAP(conn net.Conn, body string) {
@@ -154,8 +177,12 @@ func rstPassportTB(i int, now time.Time) string {
 		`</wst:RequestSecurityTokenResponse>`
 }
 
-// rstCompactToken は各サービス向けの t=...&p=... 形式のトークン。
-func rstCompactToken(i int, addr, token string, now time.Time) string {
+// rstCompactToken は各サービス向けの t=...&p=... 形式のトークン。withProof なら鍵も付ける。
+func rstCompactToken(i int, addr, token string, withProof bool, now time.Time) string {
+	proof := ""
+	if withProof {
+		proof = `<wst:RequestedProofToken><wst:BinarySecret>` + randomBase64(24) + `</wst:BinarySecret></wst:RequestedProofToken>`
+	}
 	id := fmt.Sprintf("PPToken%d", i)
 	return `<wst:RequestSecurityTokenResponse>` +
 		`<wst:TokenType>urn:passport:compact</wst:TokenType>` +
@@ -168,6 +195,7 @@ func rstCompactToken(i int, addr, token string, now time.Time) string {
 		`<wsse:KeyIdentifier ValueType="urn:passport:compact"></wsse:KeyIdentifier>` +
 		`<wsse:Reference URI="#` + id + `"></wsse:Reference>` +
 		`</wst:RequestedTokenReference>` +
+		proof +
 		`</wst:RequestSecurityTokenResponse>`
 }
 

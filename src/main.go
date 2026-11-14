@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/sabaraido/lingua-franca-messenger/src/core"
@@ -63,11 +64,17 @@ func main() {
 
 	// Passportチケット・SBキーなど、サーバー間で受け渡す使い捨てトークン
 	tokens := core.NewTokenStore()
+	// Windows Live Messenger 向けの、期限まで使い回すチケット。鍵はユーザーファイルと同じ場所に置く
+	tickets, err := core.LoadSignedTickets(filepath.Join(filepath.Dir(usersPath), "ticket.key"))
+	if err != nil {
+		log.Fatalf("ticket key: %v", err)
+	}
 
 	sb := switchboard.New(sbListenAddr, tokens)
 	sb.PublicAddr = sbPublicAddr
 
 	ns := notification.New(nsListenAddr, sbPublicAddr, store, tokens)
+	ns.Tickets = tickets
 	sb.NS = ns
 
 	ds := dispatch.New(dsAddr, nsPublicAddr)
@@ -76,6 +83,7 @@ func main() {
 		ds.PublicAddr = net.JoinHostPort(publicHost, port)
 	}
 	ps := passport.New("127.0.0.1:8080", store, tokens)
+	ps.Tickets = tickets
 
 	errCh := make(chan error, 6)
 

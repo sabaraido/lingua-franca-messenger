@@ -7,12 +7,14 @@ package core
 //	MSNP9:  6.0 / 6.1
 //	MSNP10: 6.2
 //	MSNP11: 7.0。7.5 は MSNP12 と並べて MSNP11 も提示してくるので、MSNP11 で接続させる
+//	MSNP18: Windows Live Messenger 2009(MSNP18 と MSNP17 しか提示しない)。対応途中
 var SupportedProtocols = map[string]int{
 	"MSNP7":  7,
 	"MSNP8":  8,
 	"MSNP9":  9,
 	"MSNP10": 10,
 	"MSNP11": 11,
+	"MSNP18": 18,
 }
 
 // NegotiateProtocol はクライアントの提示順(新しい順)に、対応している最初のバージョンを選ぶ。

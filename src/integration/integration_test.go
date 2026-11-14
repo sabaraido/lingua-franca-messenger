@@ -5,7 +5,9 @@ package integration
 import (
 	"bufio"
 	"crypto/md5"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/xml"
 	"fmt"
 	"html"
 	"io"
@@ -80,9 +82,12 @@ func newEnv(t *testing.T) *env {
 	tokens := core.NewTokenStore()
 	sb := switchboard.New(e.sbAddr, tokens)
 	sb.PublicAddr = e.sbAddr
+	tickets := core.NewSignedTickets()
 	ns := notification.New(e.nsAddr, e.sbAddr, store, tokens)
+	ns.Tickets = tickets
 	sb.NS = ns
 	ps := passport.New(e.ppAddr, store, tokens)
+	ps.Tickets = tickets
 	ds := dispatch.New(e.dsAddr, e.nsAddr)
 	ds.PublicAddr = e.dsAddr
 	go sb.ListenAndServe()
@@ -977,5 +982,210 @@ func TestPresenceBetweenMSNP7AndMSNP8(t *testing.T) {
 	bob.cmd("CHG AWY 0")
 	if line := old.expect("NLN AWY bob@test.com"); line != "NLN AWY bob@test.com Bob" {
 		t.Fatalf("NLN to MSNP7 = %q", line)
+	}
+}
+
+// rstRequestWLM は Windows Live Messenger 2009 が RST.srf に送るリクエスト(の主要部分)。
+func rstRequestWLM(email, password string) string {
+	tok := func(id int, addr, policy string) string {
+		p := ""
+		if policy != "" {
+			p = `<wsse:PolicyReference URI="` + policy + `"></wsse:PolicyReference>`
+		}
+		return fmt.Sprintf(`<wst:RequestSecurityToken Id="RST%d"><wst:RequestType>http://schemas.xmlsoap.org/ws/2004/04/security/trust/Issue</wst:RequestType><wsp:AppliesTo><wsa:EndpointReference><wsa:Address>%s</wsa:Address></wsa:EndpointReference></wsp:AppliesTo>%s</wst:RequestSecurityToken>`, id, addr, p)
+	}
+	return `<?xml version="1.0" encoding="UTF-8"?>
+<Envelope xmlns="http://schemas.xmlsoap.org/soap/envelope/" xmlns:wsse="http://schemas.xmlsoap.org/ws/2003/06/secext" xmlns:wsp="http://schemas.xmlsoap.org/ws/2002/12/policy" xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/03/addressing" xmlns:wst="http://schemas.xmlsoap.org/ws/2004/04/trust">
+<Header><wsse:Security><wsse:UsernameToken Id="user"><wsse:Username>` + email + `</wsse:Username><wsse:Password>` + password + `</wsse:Password></wsse:UsernameToken></wsse:Security></Header>
+<Body><ps:RequestMultipleSecurityTokens xmlns:ps="http://schemas.microsoft.com/Passport/SoapServices/PPCRL" Id="RSTS">` +
+		tok(0, "http://Passport.NET/tb", "") +
+		tok(1, "messengerclear.live.com", "MBI_KEY_OLD") +
+		tok(2, "messenger.msn.com", "?id=507") +
+		tok(3, "contacts.msn.com", "MBI") +
+		`</ps:RequestMultipleSecurityTokens></Body></Envelope>`
+}
+
+func tokenFor(t *testing.T, body, addr string) string {
+	t.Helper()
+	re := regexp.MustCompile(`<wsa:Address>` + regexp.QuoteMeta(addr) + `</wsa:Address>.*?<wsse:BinarySecurityToken[^>]*>([^<]*)</wsse:BinarySecurityToken>`)
+	m := re.FindStringSubmatch(body)
+	if m == nil {
+		t.Fatalf("no token for %s in %s", addr, body)
+	}
+	return html.UnescapeString(m[1])
+}
+
+func TestLoginMSNP18(t *testing.T) {
+	e := newEnv(t)
+	resp, err := http.Post("http://"+e.ppAddr+"/RST2.srf", "text/xml", strings.NewReader(rstRequestWLM("alice@test.com", "pw")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	body := string(b)
+	ticket := tokenFor(t, body, "messengerclear.live.com")
+	// messengerclear.live.com には、チャレンジの暗号化に使う鍵が付く
+	if !regexp.MustCompile(`messengerclear\.live\.com</wsa:Address>.*?<wst:BinarySecret>`).MatchString(body) {
+		t.Fatalf("no proof token for messengerclear.live.com: %s", body)
+	}
+	// RST2.srf は SOAP 1.2 / WS-Trust 2005 の形で返す
+	for _, want := range []string{`xmlns:S="http://www.w3.org/2003/05/soap-envelope"`, `xmlns:wst="http://schemas.xmlsoap.org/ws/2005/02/trust"`, `<wst:Lifetime>`, `<psf:credProperty Name="AuthMembername">alice@test.com<`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("RST2 response lacks %s", want)
+		}
+	}
+	if err := xml.Unmarshal([]byte(body), new(struct{})); err != nil {
+		t.Fatalf("RST2 response is not well-formed: %v", err)
+	}
+	// アドレス帳のチケットは別のものが発行される
+	if abch := tokenFor(t, body, "contacts.msn.com"); abch == ticket {
+		t.Fatal("contacts.msn.com should get its own ticket")
+	}
+
+	ds := dial(t, "wlm/ds", e.dsAddr)
+	ds.cmd("VER MSNP18 MSNP17 CVR0")
+	ds.expect("VER 1 MSNP18 CVR0")
+
+	c := dial(t, "wlm", e.nsAddr)
+	c.cmd("VER MSNP18 MSNP17 CVR0")
+	c.expect("VER 1 MSNP18")
+	c.cmd("CVR 0x0411 winnt 5.1 i386 MSNMSGR 14.0.8117.0416 msmsgs alice@test.com")
+	c.expect("CVR 2 14.0.8117.0416")
+	c.cmd("USR SSO I alice@test.com")
+	c.expect("USR 3 SSO S MBI_KEY_OLD ")
+	c.cmd("USR SSO S %s %s {F52973B6-C926-4BAD-9BA8-7C1E840E4AB0}", ticket, "AAAAAA==")
+	c.expect("USR 4 OK alice@test.com 1 0")
+
+	// 2009 はチケットを期限まで保存して使い回す(先のセッションは OUT OTH で切られる)
+	c2 := dial(t, "wlm2", e.nsAddr)
+	c2.cmd("VER MSNP18 CVR0")
+	c2.expect("VER")
+	c2.cmd("USR SSO I alice@test.com")
+	c2.expect("USR 2 SSO S")
+	c2.cmd("USR SSO S %s AAAA {F52973B6-C926-4BAD-9BA8-7C1E840E4AB0}", ticket)
+	c2.expect("USR 3 OK alice@test.com")
+	// ログイン直後に SBS、プロフィール(アドレス帳に移行済み)、自分の UBX を送る
+	c2.expect("SBS 0 null")
+	if _, profile := c2.expectMSG("MSG Hotmail Hotmail"); !strings.Contains(profile, "ABCHMigrated: 1") {
+		t.Fatalf("profile should say ABCHMigrated: 1: %q", profile)
+	}
+	c2.expect("UBX 1:alice@test.com 0")
+	// 他人のチケットでは入れない
+	c3 := dial(t, "wlm3", e.nsAddr)
+	c3.cmd("VER MSNP18 CVR0")
+	c3.expect("VER")
+	c3.cmd("USR SSO I bob@test.com")
+	c3.expect("USR 2 SSO S")
+	c3.cmd("USR SSO S %s AAAA {F52973B6-C926-4BAD-9BA8-7C1E840E4AB0}", ticket)
+	c3.expect("911 3")
+
+	// ADL は今のところ受理だけする
+	xmlBody := `<ml l="1"><d n="test.com"><c n="bob" l="3" t="1"/></d></ml>`
+	c2.tr++
+	c2.raw(fmt.Sprintf("ADL %d %d\r\n%s", c2.tr, len(xmlBody), xmlBody))
+	c2.expect(fmt.Sprintf("ADL %d OK", c2.tr))
+}
+
+func TestMSNP18ForgedTicketRejected(t *testing.T) {
+	e := newEnv(t)
+	c := dial(t, "wlm", e.nsAddr)
+	c.cmd("VER MSNP18 CVR0")
+	c.expect("VER")
+	c.cmd("USR SSO I alice@test.com")
+	c.expect("USR 2 SSO S")
+	c.cmd("USR SSO S t=forged&p=forged AAAA {F52973B6-C926-4BAD-9BA8-7C1E840E4AB0}")
+	c.expect("911 3")
+	c.expectClosed()
+}
+
+// abch は Windows Live Messenger と同じ形でアドレス帳を呼び出す。
+func (e *env) abch(ticket, service, action, body string) (int, string) {
+	e.t.Helper()
+	req := `<?xml version="1.0" encoding="utf-8"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">` +
+		`<soap:Header><ABApplicationHeader xmlns="http://www.msn.com/webservices/AddressBook">` +
+		`<ApplicationId>AAD9B99B-58E6-4F23-B975-D9EC1F9EC24A</ApplicationId><IsMigration>false</IsMigration>` +
+		`<PartnerScenario>Initial</PartnerScenario></ABApplicationHeader>` +
+		`<ABAuthHeader xmlns="http://www.msn.com/webservices/AddressBook"><ManagedGroupRequest>false</ManagedGroupRequest>` +
+		`<TicketToken>` + html.EscapeString(ticket) + `</TicketToken></ABAuthHeader></soap:Header>` +
+		`<soap:Body>` + body + `</soap:Body></soap:Envelope>`
+	r, _ := http.NewRequest("POST", "http://"+e.ppAddr+"/abservice/"+service, strings.NewReader(req))
+	r.Header.Set("SOAPAction", "http://www.msn.com/webservices/AddressBook/"+action)
+	resp, err := http.DefaultClient.Do(r)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b)
+}
+
+func TestAddressBookForWLM(t *testing.T) {
+	e := newEnv(t)
+	if err := e.store.SetPrivacy("alice@test.com", "BL"); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post("http://"+e.ppAddr+"/RST2.srf", "text/xml", strings.NewReader(rstRequestWLM("alice@test.com", "pw")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	ticket := tokenFor(t, string(b), "contacts.msn.com")
+
+	status, body := e.abch(ticket, "SharingService.asmx", "FindMembership",
+		`<FindMembership xmlns="http://www.msn.com/webservices/AddressBook"><serviceFilter><Types><ServiceType>Messenger</ServiceType></Types></serviceFilter></FindMembership>`)
+	if status != 200 {
+		t.Fatalf("FindMembership: %d %s", status, body)
+	}
+	if err := xml.Unmarshal([]byte(body), new(struct{})); err != nil {
+		t.Fatalf("FindMembership response is not well-formed: %v", err)
+	}
+	for _, role := range []string{"Allow", "Reverse"} {
+		if !regexp.MustCompile(`<MemberRole>` + role + `</MemberRole><Members><Member[^>]*>.*?<PassportName>bob@test.com</PassportName>`).MatchString(body) {
+			t.Errorf("bob should be in %s: %s", role, body)
+		}
+	}
+
+	status, body = e.abch(ticket, "abservice.asmx", "ABFindContactsPaged",
+		`<ABFindContactsPaged xmlns="http://www.msn.com/webservices/AddressBook"><abView>MessengerClient8</abView></ABFindContactsPaged>`)
+	if status != 200 {
+		t.Fatalf("ABFindContactsPaged: %d %s", status, body)
+	}
+	if err := xml.Unmarshal([]byte(body), new(struct{})); err != nil {
+		t.Fatalf("ABFindContactsPaged response is not well-formed: %v", err)
+	}
+	for _, want := range []string{
+		`<contactType>Regular</contactType><quickName>Bob</quickName><passportName>bob@test.com</passportName>`,
+		`<contactType>Me</contactType><quickName>Alice A</quickName><passportName>alice@test.com</passportName>`,
+		`<Name>MSN.IM.BLP</Name><Value>2</Value>`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("ABFindContactsPaged lacks %s", want)
+		}
+	}
+
+	// アドレス帳の CircleTicket を、NSの USR SHA A で base64 にして送り返す
+	circle := regexp.MustCompile(`<CircleTicket>([^<]*)</CircleTicket>`).FindStringSubmatch(body)
+	if circle == nil {
+		t.Fatalf("no CircleTicket: %s", body)
+	}
+	c := dial(t, "wlm", e.nsAddr)
+	c.cmd("VER MSNP18 CVR0")
+	c.expect("VER")
+	c.cmd("USR SSO I alice@test.com")
+	c.expect("USR 2 SSO S")
+	c.cmd("USR SSO S %s AAAA {F52973B6-C926-4BAD-9BA8-7C1E840E4AB0}", tokenFor(t, string(b), "messengerclear.live.com"))
+	c.expect("USR 3 OK alice@test.com")
+	c.cmd("USR SHA A %s", base64.StdEncoding.EncodeToString([]byte(circle[1])))
+	c.expect("USR 4 OK alice@test.com 0 0")
+	c.cmd("USR SHA A %s", base64.StdEncoding.EncodeToString([]byte("forged")))
+	c.expect("911 5")
+
+	// アドレス帳のチケットでないもの・偽造したものは断る
+	for _, bad := range []string{tokenFor(t, string(b), "messengerclear.live.com"), "t=forged&p="} {
+		if status, _ := e.abch(bad, "abservice.asmx", "ABFindContactsPaged", `<ABFindContactsPaged xmlns="http://www.msn.com/webservices/AddressBook"/>`); status != 500 {
+			t.Errorf("ticket %q: status %d, want 500", bad, status)
+		}
 	}
 }

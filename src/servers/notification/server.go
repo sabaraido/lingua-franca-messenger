@@ -3,6 +3,7 @@ package notification
 import (
 	"bufio"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -30,6 +31,8 @@ type Server struct {
 	SwitchboardAddr string
 	Users           *core.UserStore
 	Tokens          *core.TokenStore
+	// Tickets は Windows Live Messenger の USR SSO S のチケット(RST2.srfで発行したもの)を検証する
+	Tickets *core.SignedTickets
 
 	// mu は sessions と、各 clientSession の状態フィールドを保護する。
 	// フィールドはそのセッション自身のgoroutineが mu.Lock 下で書き換え、
@@ -49,7 +52,7 @@ type clientSession struct {
 
 	msnpVersion  string // VERで決めたバージョン("MSNP8" など)
 	proto        int    // msnpVersion の番号部分(8, 9, 10, 11)
-	pendingEmail string // USR TWN I / USR MD5 I で名乗ったアドレス(未認証)
+	pendingEmail string // USR TWN I / USR MD5 I / USR SSO I で名乗ったアドレス(未認証)
 	userEmail    string // 認証済みのアドレス。チケット照合に成功するまで空
 	friendlyName string
 	status       string
@@ -301,6 +304,8 @@ func (s *Server) handleConn(conn net.Conn) {
 var payloadCommands = map[string]bool{
 	"UUX": true, // MSNP11: パーソナルメッセージ・再生中の曲
 	"QRY": true, // CHLへの応答
+	"ADL": true, // MSNP13以降: コンタクトリストをNSに伝える(XML)
+	"RML": true, // MSNP13以降: コンタクトリストから外す(XML)
 }
 
 const maxPayload = 8 * 1024
@@ -328,6 +333,10 @@ func (s *Server) handlePayloadCommand(sess *clientSession, parts []string, paylo
 	case "QRY":
 		// こちらからCHLは送らないが、届いた場合は受理だけする
 		s.send(sess, fmt.Sprintf("QRY %s\r\n", trID))
+	case "ADL", "RML":
+		// TODO(MSNP18): 中身(<ml><d n="domain"><c n="user" l="lists" t="1"/></d></ml>)を反映する
+		log.Printf("[NS] %s from %s (not applied yet): %s", parts[0], sess.userEmail, payload)
+		s.send(sess, fmt.Sprintf("%s %s OK\r\n", parts[0], trID))
 	}
 }
 
@@ -526,8 +535,8 @@ func (s *Server) handleLine(sess *clientSession, line string) {
 }
 
 func (s *Server) handleUSR(sess *clientSession, parts []string, trID string) {
-	if sess.userEmail != "" {
-		// 認証済みセッションでの再USRは受け付けない
+	if sess.userEmail != "" && !(len(parts) >= 4 && parts[2] == "SHA") {
+		// 認証済みセッションでの再USRは受け付けない(MSNP18 の USR SHA A は認証後に来る)
 		s.send(sess, fmt.Sprintf("911 %s\r\n", trID))
 		return
 	}
@@ -555,6 +564,34 @@ func (s *Server) handleUSR(sess *clientSession, parts []string, trID string) {
 		}
 		s.completeLogin(sess, trID)
 
+	case len(parts) >= 5 && parts[2] == "SSO" && parts[3] == "I" && sess.proto >= 13:
+		// MSNP13以降: RST.srf で messengerclear.live.com のチケットと鍵を取らせ、
+		// このチャレンジ(nonce)を鍵で暗号化したものとチケットを USR SSO S で返してもらう
+		pending := parts[4]
+		s.update(func() { sess.pendingEmail = pending })
+		s.send(sess, fmt.Sprintf("USR %s SSO S MBI_KEY_OLD %s\r\n", trID, randomBase64(48)))
+
+	case len(parts) >= 6 && parts[2] == "SSO" && parts[3] == "S" && sess.pendingEmail != "":
+		// USR trID SSO S ticket response [machineGUID]
+		// response(nonceを暗号化したもの)は照合しない。チケットはRST2.srfの認証を経て発行した署名付きのもの。
+		// クライアントは期限まで同じチケットを使い回す
+		owner, ok := "", false
+		if s.Tickets != nil {
+			owner, ok = s.Tickets.Verify(parts[4], core.TicketNS)
+		}
+		if !ok || !strings.EqualFold(owner, sess.pendingEmail) {
+			log.Printf("[NS] USR: invalid SSO ticket for %s", sess.pendingEmail)
+			s.send(sess, fmt.Sprintf("911 %s\r\n", trID))
+			sess.conn.Close()
+			return
+		}
+		s.completeLogin(sess, trID)
+
+	case len(parts) >= 5 && parts[2] == "SHA" && parts[3] == "A" && sess.proto >= 18 && sess.userEmail != "":
+		// MSNP18: ログイン後、アドレス帳でもらった CircleTicket を base64 にして送ってくる
+		// (グループ会話「サークル」を使うための認証)
+		s.handleCircleAuth(sess, parts[4], trID)
+
 	case len(parts) >= 5 && parts[2] == "MD5" && parts[3] == "I" && sess.proto < 8:
 		// MSNP7以前: saltを渡し、md5(salt+password)を返してもらう
 		pending := parts[4]
@@ -575,6 +612,24 @@ func (s *Server) handleUSR(sess *clientSession, parts []string, trID string) {
 		s.send(sess, fmt.Sprintf("911 %s\r\n", trID))
 		sess.conn.Close()
 	}
+}
+
+// handleCircleAuth は USR SHA A の CircleTicket を検証する。
+//
+//	USR trID SHA A base64(CircleTicket) -> USR trID OK email 0 0
+func (s *Server) handleCircleAuth(sess *clientSession, arg, trID string) {
+	owner, ok := "", false
+	if outer, err := base64.StdEncoding.DecodeString(arg); err == nil && s.Tickets != nil {
+		if inner, err := base64.StdEncoding.DecodeString(string(outer)); err == nil {
+			owner, ok = s.Tickets.Verify(string(inner), core.TicketCircle)
+		}
+	}
+	if !ok || !strings.EqualFold(owner, sess.userEmail) {
+		log.Printf("[NS] USR SHA: invalid circle ticket for %s", sess.userEmail)
+		s.send(sess, fmt.Sprintf("911 %s\r\n", trID))
+		return
+	}
+	s.send(sess, fmt.Sprintf("USR %s OK %s 0 0\r\n", trID, sess.userEmail))
 }
 
 // completeLogin は認証に成功した pendingEmail でログインさせ、USR OK とプロフィールを送る。
@@ -694,6 +749,16 @@ func (s *Server) setFriendlyName(sess *clientSession, name string) {
 	}
 }
 
+// profileExtra はプロフィールの末尾の行。
+// MSNP13以降(Windows Live Messenger)は連絡先リストがアドレス帳(ABCH)にあるので ABCHMigrated: 1。
+// 0 だとクライアントはアドレス帳への移行を待って、サインインが遅くなる。
+func profileExtra(proto int) string {
+	if proto >= 18 {
+		return "ABCHMigrated: 1\r\nMPOPEnabled: 1\r\n"
+	}
+	return "ABCHMigrated: 0\r\n"
+}
+
 func (s *Server) sendProfile(sess *clientSession) {
 	// クライアントはClientIP/ClientPortを自分のアドレスと比べてNATの有無を判定する。
 	// 食い違うとUPnPルーターの探索が始まり、見つからないとタイムアウトまでUIが固まる。
@@ -727,10 +792,17 @@ func (s *Server) sendProfile(sess *clientSession) {
 			"MSPAuth: dummy\r\n"+
 			"ClientIP: %s\r\n"+
 			"ClientPort: %d\r\n"+
-			"ABCHMigrated: 0\r\n\r\n",
-		time.Now().Unix(), sess.userEmail, clientIP, clientPort,
+			"%s\r\n",
+		time.Now().Unix(), sess.userEmail, clientIP, clientPort, profileExtra(sess.proto),
 	)
+	if sess.proto >= 18 {
+		s.send(sess, "SBS 0 null\r\n")
+	}
 	s.send(sess, fmt.Sprintf("MSG Hotmail Hotmail %d\r\n%s", len(body), body))
+	if sess.proto >= 18 {
+		// MSNP18 ではログイン直後に、自分自身のパーソナルメッセージ(空)も送る
+		s.send(sess, fmt.Sprintf("UBX 1:%s 0\r\n", sess.userEmail))
+	}
 }
 
 // SendRNG は招待相手にRNGを送る。相手がオフライン・非表示、または呼び出し元をブロックしていればfalse。
@@ -796,6 +868,12 @@ func randomHex(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+func randomBase64(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return base64.StdEncoding.EncodeToString(b)
 }
 
 func randomAlnum(n int) string {

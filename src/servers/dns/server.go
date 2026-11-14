@@ -16,6 +16,8 @@ var DefaultZones = []string{
 	"messenger.hotmail.com", // DS / gateway
 	"passport.com",          // nexus / login
 	"passport.net",
+	"login.live.com",   // Windows Live Messenger(MSNP15以降)のログイン
+	"contacts.msn.com", // Windows Live Messenger のアドレス帳(ABCH)
 }
 
 const (

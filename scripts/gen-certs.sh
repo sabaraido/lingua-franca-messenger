@@ -35,7 +35,7 @@ umask 077
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-# 7.5 は loginnet.passport.com でPassportにアクセスする
+# 7.5 は loginnet.passport.com、Windows Live Messenger は login.live.com と contacts.msn.com にHTTPSでアクセスする
 cat >"$tmp/server.cnf" <<'EOF'
 [req]
 distinguished_name = dn
@@ -46,7 +46,7 @@ CN = login.passport.com
 basicConstraints = CA:FALSE
 keyUsage = digitalSignature, keyEncipherment
 extendedKeyUsage = serverAuth
-subjectAltName = DNS:login.passport.com, DNS:loginnet.passport.com, DNS:nexus.passport.com, DNS:messenger.hotmail.com, DNS:*.passport.com, DNS:*.passport.net
+subjectAltName = DNS:login.passport.com, DNS:loginnet.passport.com, DNS:nexus.passport.com, DNS:messenger.hotmail.com, DNS:*.passport.com, DNS:*.passport.net, DNS:login.live.com, DNS:contacts.msn.com, DNS:*.contacts.msn.com, DNS:*.omega.contacts.msn.com
 EOF
 
 new_ca=false
