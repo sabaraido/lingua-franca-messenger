@@ -10,12 +10,14 @@ import (
 	"time"
 )
 
-// Zones はLFMサーバー自身のIPを返すドメイン(サブドメインを含む)。
+// DefaultZones はLFMサーバー自身のIPを返すドメイン(サブドメインを含む)。
 // クライアントのhostsファイルを書き換えずに、MSN関連の接続先をLFMへ向けるために使う。
-var Zones = []string{
+var DefaultZones = []string{
 	"messenger.hotmail.com", // DS / gateway
 	"passport.com",          // nexus / login
 	"passport.net",
+	"login.live.com",   // Windows Live Messenger(MSNP15以降)のログイン
+	"contacts.msn.com", // Windows Live Messenger のアドレス帳(ABCH)
 }
 
 const (
@@ -37,11 +39,17 @@ const (
 type Server struct {
 	ListenAddr string
 	AnswerIP   net.IP
-	Upstream   string // 例: "8.8.8.8:53"。空なら転送しない
+	Upstream   string   // 例: "8.8.8.8:53"。空なら転送しない
+	Zones      []string // LFMへ向けるドメイン。既定は DefaultZones
 }
 
 func New(listenAddr string, answerIP net.IP, upstream string) *Server {
-	return &Server{ListenAddr: listenAddr, AnswerIP: answerIP.To4(), Upstream: upstream}
+	return &Server{
+		ListenAddr: listenAddr,
+		AnswerIP:   answerIP.To4(),
+		Upstream:   upstream,
+		Zones:      append([]string(nil), DefaultZones...),
+	}
 }
 
 func (s *Server) ListenAndServe() error {
@@ -76,7 +84,7 @@ func (s *Server) handle(pc net.PacketConn, addr net.Addr, query []byte) {
 	switch {
 	case q.opcode != 0:
 		resp = buildResponse(query, q, rcodeNI, nil)
-	case inZones(q.name):
+	case inZones(s.Zones, q.name):
 		var ip net.IP
 		if q.qtype == typeA && q.qclass == classIN {
 			ip = s.AnswerIP
@@ -101,9 +109,9 @@ func (s *Server) handle(pc net.PacketConn, addr net.Addr, query []byte) {
 	}
 }
 
-func inZones(name string) bool {
+func inZones(zones []string, name string) bool {
 	name = strings.TrimSuffix(strings.ToLower(name), ".")
-	for _, z := range Zones {
+	for _, z := range zones {
 		if name == z || strings.HasSuffix(name, "."+z) {
 			return true
 		}

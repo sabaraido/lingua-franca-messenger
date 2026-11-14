@@ -6,6 +6,8 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/sabaraido/lingua-franca-messenger/src/core"
 	"github.com/sabaraido/lingua-franca-messenger/src/servers/dispatch"
@@ -13,6 +15,7 @@ import (
 	"github.com/sabaraido/lingua-franca-messenger/src/servers/notification"
 	"github.com/sabaraido/lingua-franca-messenger/src/servers/passport"
 	"github.com/sabaraido/lingua-franca-messenger/src/servers/switchboard"
+	"github.com/sabaraido/lingua-franca-messenger/src/servers/web"
 )
 
 func getEnv(key, fallback string) string {
@@ -34,6 +37,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("userstore init failed: %v", err)
 	}
+	// 3.x・4.x・Windows Messenger 4.x(MSNP7以前)のMD5認証。LFM_LEGACY_MD5=off で無効化
+	store.LegacyMD5 = getEnv("LFM_LEGACY_MD5", "on") != "off"
 
 	if *addUser != "" {
 		email, password, friendlyName, perr := parseAddUser(*addUser)
@@ -59,17 +64,28 @@ func main() {
 
 	// Passportチケット・SBキーなど、サーバー間で受け渡す使い捨てトークン
 	tokens := core.NewTokenStore()
+	// Windows Live Messenger 向けの、期限まで使い回すチケット。鍵はユーザーファイルと同じ場所に置く
+	tickets, err := core.LoadSignedTickets(filepath.Join(filepath.Dir(usersPath), "ticket.key"))
+	if err != nil {
+		log.Fatalf("ticket key: %v", err)
+	}
 
 	sb := switchboard.New(sbListenAddr, tokens)
 	sb.PublicAddr = sbPublicAddr
 
 	ns := notification.New(nsListenAddr, sbPublicAddr, store, tokens)
+	ns.Tickets = tickets
 	sb.NS = ns
 
 	ds := dispatch.New(dsAddr, nsPublicAddr)
+	ds.PublicAddr = publicHost + ":1863"
+	if _, port, err := net.SplitHostPort(dsAddr); err == nil && port != "" {
+		ds.PublicAddr = net.JoinHostPort(publicHost, port)
+	}
 	ps := passport.New("127.0.0.1:8080", store, tokens)
+	ps.Tickets = tickets
 
-	errCh := make(chan error, 5)
+	errCh := make(chan error, 6)
 
 	go func() { errCh <- ds.ListenAndServe() }()
 	go func() { errCh <- ns.ListenAndServe() }()
@@ -85,7 +101,20 @@ func main() {
 			log.Fatalf("LFM_PUBLIC_HOST must be an IPv4 address for DNS (got %q)", publicHost)
 		}
 		dnsServer := dns.New(dnsAddr, answerIP, os.Getenv("LFM_DNS_UPSTREAM"))
+		// LFM_DNS_EXTRA_ZONES=msn.com,... で、LFMへ向けるドメインを追加する
+		for _, z := range strings.Split(os.Getenv("LFM_DNS_EXTRA_ZONES"), ",") {
+			if z = strings.TrimSpace(z); z != "" {
+				dnsServer.Zones = append(dnsServer.Zones, strings.ToLower(z))
+			}
+		}
 		go func() { errCh <- dnsServer.ListenAndServe() }()
+	}
+
+	// Web: クライアント設定などHTTPで配信するもの。LFM_WEB_ADDR=off で無効化
+	if webAddr := getEnv("LFM_WEB_ADDR", ":80"); webAddr != "off" {
+		webServer := web.New(webAddr)
+		webServer.Handle("/Config/MsgrConfig.asmx", web.MsgrConfigHandler())
+		go func() { errCh <- webServer.ListenAndServe() }()
 	}
 
 	if err := <-errCh; err != nil {

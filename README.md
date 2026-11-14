@@ -1,26 +1,39 @@
 # Lingua Franca Messenger (LFM)
 
-An MSN Messenger protocol emulator server that supports multiple MSNP versions (MSNP8/9/10) through a common internal event representation.
+An MSN Messenger protocol emulator server that supports multiple MSNP versions (MSNP7–11) through a common internal event representation.
 
 > **Disclaimer**: This project is an unofficial fan-made server emulator and is not affiliated with, endorsed by, or connected to Microsoft Corporation in any way. MSN Messenger and related trademarks are the property of Microsoft Corporation.
 
 ## Features
 
-- ✅ MSNP8/9/10 support
+- ✅ Supports MSN Messenger 3.6 through 7.5 and Windows Messenger 4.5 (MSNP7–11; 7.5 connects using MSNP11)
+- ✅ Personal messages for 7.0 / 7.5
 - ✅ Passport (TWN) authentication emulation
 - ✅ Multi-user simultaneous login
 - ✅ Real-time status change notifications
-- ✅ Text chat between users
+- ✅ Text chat between users, across protocol versions
+- ✅ Each client sees its contacts' real client version, so 7.0/7.5 itself tells the user when a contact on 5.0/6.x can't receive nudges or winks. If one still reaches an older client, the server shows it as a text notice instead.
 - ✅ File transfer support
-- ✅ Contact list management (add/remove/block)
+- ✅ Contact list management (add/remove/block) and contact groups
 - ✅ Persistent user data
 
-## Tested Clients
+## Supported Clients
 
-| Client | Version | Status |
-|--------|---------|--------|
-| MSN Messenger | 6.2.0205 | ✅ Working |
-| MSN Messenger | 5.0.0575 | ✅ Working |
+| Client | Protocol | Status |
+|--------|----------|--------|
+| MSN Messenger 3.6 | MSNP7 | ✅ Tested (MD5 sign-in) |
+| MSN Messenger 4.6 | MSNP7 | ✅ Tested (MD5 sign-in) |
+| Windows Messenger 4.5 (4.5.0127) | MSNP7 | ✅ Tested (MD5 sign-in) |
+| MSN Messenger 5.0 (5.0.0575) | MSNP8 | ✅ Tested |
+| MSN Messenger 6.0 / 6.1 | MSNP9 | 🔄 Not yet tested on a real client |
+| MSN Messenger 6.2 (6.2.0205) | MSNP10 | ✅ Tested |
+| MSN Messenger 7.0 (7.0.0820) | MSNP11 | ✅ Tested |
+| MSN Messenger 7.5 (7.5.0324) | MSNP11 | ✅ Tested (sign-in via RST.srf) |
+| Windows Live Messenger 2009 (14.0.8117) | MSNP18 | 🧪 Experimental: signs in and loads the address book, but sign-in is slow and presence is not implemented yet |
+
+Windows Live Messenger keeps its contact list in a SOAP address book service (ABCH) instead of the NS. LFM serves a minimal ABCH (\`FindMembership\`, \`ABFindContactsPaged\`) behind the same stunnel, plus \`RST2.srf\` sign-in. Its tickets are signed with \`data/ticket.key\` (created on first start), because the client reuses them until they expire; keep this file as private as \`users.json\`. Adding or removing contacts from Windows Live Messenger is not implemented yet. Other Windows Live Messenger versions (8.x, 2011+) are untested.
+
+MSNP7 clients sign in with MD5 challenge-response instead of Passport. For this, LFM also stores \`md5(salt + password)\` per user, created by \`-adduser\` or by the user's next successful sign-in from 5.0 or later. Anyone who obtains this value can sign in with an MSNP7 client. Set \`LFM_LEGACY_MD5=off\` to refuse MD5 sign-in and drop the stored values.
 
 ## Requirements
 

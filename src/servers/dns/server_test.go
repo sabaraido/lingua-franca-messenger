@@ -29,9 +29,12 @@ func TestInZones(t *testing.T) {
 		"hotmail.com":                   false,
 		"notpassport.com":               false,
 		"config.messenger.msn.com":      false,
+		"login.live.com":                true,
+		"live.com":                      false,
+		"omega.contacts.msn.com":        true,
 	}
 	for name, want := range cases {
-		if got := inZones(name); got != want {
+		if got := inZones(DefaultZones, name); got != want {
 			t.Errorf("inZones(%q) = %v, want %v", name, got, want)
 		}
 	}

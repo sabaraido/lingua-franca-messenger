@@ -21,6 +21,20 @@ type Contact struct {
 	FriendlyName string   `json:"friendly_name"`
 	Lists        []string `json:"lists"`
 	GUID         string   `json:"guid"`
+	// Groups は所属グループのGUID。DefaultGroup はMSNP8/9のグループ0
+	// ("その他の連絡先")への明示的な所属を表す。空ならグループ0だけに所属。
+	Groups []string `json:"groups,omitempty"`
+}
+
+// DefaultGroup はMSNP8/9のグループ0を表す Contact.Groups の値。
+// MSNP10以降にはグループ0がなく、どのグループにも属さない連絡先として扱う。
+const DefaultGroup = "default"
+
+// Group はユーザーが作ったコンタクトのグループ。
+type Group struct {
+	ID   int    `json:"id"`   // MSNP8/9 のグループ番号(1以上。0は既定グループ)
+	GUID string `json:"guid"` // MSNP10以降のグループID
+	Name string `json:"name"`
 }
 
 // HasList はコンタクトが指定リスト(FL/AL/BL/RL)に入っているかを返す。
@@ -37,8 +51,12 @@ type User struct {
 	Email        string `json:"email"`
 	PasswordHash string `json:"password_hash"`
 	FriendlyName string `json:"friendly_name"`
+	// MD5Salt / MD5Hash はMSNP7以前のMD5認証用(legacyauth.go)。
+	MD5Salt string `json:"md5_salt,omitempty"`
+	MD5Hash string `json:"md5_hash,omitempty"`
 	// Privacy はBLPの設定。"AL"(BL以外は許可, 既定) か "BL"(AL以外は拒否)。
 	Privacy  string     `json:"privacy,omitempty"`
+	Groups   []*Group   `json:"groups,omitempty"`
 	Contacts []*Contact `json:"contacts,omitempty"`
 }
 
@@ -47,6 +65,9 @@ type User struct {
 // 別プロセス(lfm -adduser)によるファイル更新は、次の参照・更新時に
 // 更新日時の変化から検知して読み込み直す。保存は一時ファイル経由で置き換える。
 type UserStore struct {
+	// LegacyMD5 は、MSNP7以前のMD5認証のための値を保存し、MD5認証を受け付けるか。
+	LegacyMD5 bool
+
 	mu      sync.RWMutex
 	path    string
 	users   map[string]*User
@@ -195,16 +216,19 @@ func (s *UserStore) AddUser(email, password, friendlyName string) error {
 	defer s.mu.Unlock()
 	s.refreshLocked()
 	key := normalizeEmail(email)
-	if existing, ok := s.users[key]; ok {
-		existing.PasswordHash = hash
-		existing.FriendlyName = friendlyName
+	u, ok := s.users[key]
+	if ok {
+		u.PasswordHash = hash
+		u.FriendlyName = friendlyName
 	} else {
-		s.users[key] = &User{
+		u = &User{
 			Email:        email,
 			PasswordHash: hash,
 			FriendlyName: friendlyName,
 		}
+		s.users[key] = u
 	}
+	s.setLegacyMD5Locked(u, password)
 	return s.save()
 }
 
@@ -238,6 +262,9 @@ func (s *UserStore) Authenticate(email, password string) bool {
 			}
 			s.mu.Unlock()
 		}
+	}
+	if valid {
+		s.rememberLegacyMD5(email, password)
 	}
 	return valid
 }
@@ -283,6 +310,7 @@ func (s *UserStore) GetContacts(userEmail string) []Contact {
 	for _, c := range user.Contacts {
 		cp := *c
 		cp.Lists = append([]string(nil), c.Lists...)
+		cp.Groups = append([]string(nil), c.Groups...)
 		list = append(list, cp)
 	}
 	return list
@@ -314,14 +342,15 @@ func (s *UserStore) SetPrivacy(email, mode string) error {
 	if mode != "AL" && mode != "BL" {
 		return fmt.Errorf("invalid privacy mode %q", mode)
 	}
-	return s.updateUser(email, func(u *User) { u.Privacy = mode })
+	return s.updateUser(email, func(u *User) error { u.Privacy = mode; return nil })
 }
 
 func (s *UserStore) SetFriendlyName(email, name string) error {
-	return s.updateUser(email, func(u *User) { u.FriendlyName = name })
+	return s.updateUser(email, func(u *User) error { u.FriendlyName = name; return nil })
 }
 
-func (s *UserStore) updateUser(email string, f func(*User)) error {
+// updateUser はユーザーを書き換えて保存する。fがエラーを返したら保存しない。
+func (s *UserStore) updateUser(email string, f func(*User) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.refreshLocked()
@@ -329,7 +358,9 @@ func (s *UserStore) updateUser(email string, f func(*User)) error {
 	if !ok {
 		return fmt.Errorf("user %s not found", email)
 	}
-	f(u)
+	if err := f(u); err != nil {
+		return err
+	}
 	return s.save()
 }
 
